@@ -1,0 +1,9 @@
+[package]
+name = "hotreload"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "A minimal Rust project for hotreload demo"
+license = "MIT"
+
+[dependencies]
