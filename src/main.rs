@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, hotreload!");
+    println!("hotreload root placeholder");
 }

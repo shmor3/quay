@@ -7,3 +7,4 @@ description = "A minimal Rust project for hotreload demo"
 license = "MIT"
 
 [dependencies]
+notify = "6.1"

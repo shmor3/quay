@@ -1,0 +1,17 @@
+[package]
+name = "hotreload-watcher"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "A small file-watcher CLI that runs a command when files change"
+license = "MIT"
+
+[dependencies]
+notify = "6.1"
+tokio = { version = "1.36", features = ["full"] }
+tokio-tungstenite = "0.20"
+futures = "0.3"
+base64 = "0.22"
+serde_json = "1.0"
+clap = { version = "4.3", features = ["derive"] }
+globset = "0.4"
