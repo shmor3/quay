@@ -1,0 +1,7 @@
+
+name: static-http
+watch:
+  - "**/*.css"
+  - "**/*.html"
+on_change: "echo \"static asset changed {path}\""
+notify: "auto"

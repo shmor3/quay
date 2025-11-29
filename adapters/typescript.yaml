@@ -1,0 +1,6 @@
+
+name: typescript
+watch:
+  - "**/*.ts"
+on_change: "npm run build -- {path}"
+notify: "reload"

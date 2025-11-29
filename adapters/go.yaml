@@ -1,0 +1,6 @@
+
+name: go
+watch:
+  - "**/*.go"
+on_change: "go build {path}"
+notify: "reload"
