@@ -43,6 +43,51 @@ Create a `.hotreloadignore` file in the repo root or pass a different file with 
 Syntax:
 
 - Lines starting with `+` are include patterns (glob syntax)
+# watchd
+
+A small, language-agnostic file watcher that runs commands incrementally and broadcasts changes to browser clients via WebSocket.
+
+## Features
+
+- Watch the current directory recursively
+- Run a command template on changes (use `{path}` to substitute the changed path)
+- Broadcast messages to connected browsers to inject CSS (`inject-css`) or request a full reload (`reload`)
+- Include/exclude pattern file support with `+` (include) and `-` (exclude) prefixes
+- Sensible default excludes: `target/**`, `.git/**`, `node_modules/**`, etc.
+- Configurable debounce, websocket port, and option to skip initial run
+
+## Quick start
+
+Build:
+
+```bash
+cargo build --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml
+```
+
+Run (example):
+
+```bash
+# run via cargo
+cargo run --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml -- "echo built {path}"
+
+# or run the produced binary directly (built in watcher/target/debug/watchd)
+./watcher/target/debug/watchd --path .
+```
+
+Flags:
+
+- `--patterns-file <path>` : path to patterns file (default `.hotreloadignore`)
+- `--debounce-ms <ms>` : debounce delay in milliseconds (default `200`)
+- `--port <port>` : websocket port (default `3012`)
+- `--no-run-on-start` : do not run command on startup
+
+## Patterns file (.hotreloadignore)
+
+Create a `.hotreloadignore` file in the repo root or pass a different file with `--patterns-file`.
+
+Syntax:
+
+- Lines starting with `+` are include patterns (glob syntax)
 - Lines starting with `-` are exclude patterns
 - Lines starting with `#` are comments
 - Blank lines are ignored
@@ -50,7 +95,7 @@ Syntax:
 
 Example:
 
-```
+```text
 # include source and static assets
 + src/**
 + static/**/*.css
@@ -104,16 +149,15 @@ Example `watcher/configs/typescript.yaml`:
 ```yaml
 name: typescript
 watch:
-	- "**/*.ts"
+  - "**/*.ts"
 on_change: "npm run build -- {path}"
 notify: "reload"
 ```
 
 Behavior:
+
 - If any config matches a changed file, the watcher runs the config's `on_change` (or `build`) command and follows its `notify` behavior. Multiple config files may match and will all be executed.
 - If no config matches, the watcher falls back to its default heuristics (inject CSS for `.css`, reload for `.html`, or run the generic `cmd_template`).
-
-Config files are intentionally simple and stored as YAML so you can author them quickly without changing the Rust code. They can also declare `ignore:` patterns that are merged into the watcher's exclude set when you don't supply a `--patterns-file`.
 
 ---
 
