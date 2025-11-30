@@ -1,6 +1,0 @@
-
-name: rust
-watch:
-  - "**/*.rs"
-on_change: "cargo build --manifest-path {path}"
-notify: "reload"

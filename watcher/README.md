@@ -82,32 +82,34 @@ If you'd like, I can add:
 - Default merge behavior that allows user overrides
 - Tests for Windows path normalization and UNC paths
 
-## Adapters
+## Config files
 
-You can add adapters — small, human-readable pseudo-language files placed in `watcher/adapters/` — to provide language-specific build or run logic. The watcher will load any adapter files it finds at startup and use them when a matching file changes.
+You can add config files — small YAML files placed in `watcher/configs/` (or `configs/`) — to provide project- or language-specific build/run logic. The watcher will load any config files it finds at startup and use them when a matching file changes.
 
-Adapter syntax (simple key: value per line):
+Config syntax (YAML):
 
-- `name: <identifier>` — adapter name
-- `watch: <glob>` — glob pattern to match changed files (can appear multiple times)
+- `name: <identifier>` — config name
+- `watch:` — a glob or sequence of globs to match changed files (e.g., `"**/*.ts"`)
 - `on_change: <cmd>` — command template to run when a matching file changes (use `{path}`)
 - `build: <cmd>` — alternative build command
 - `notify: <auto|reload|inject-css|none>` — how to notify clients; `auto` uses extension heuristics
+- `ignore:` — optional list of exclude globs that will be merged into the watcher's exclude set (used when no `--patterns-file` is supplied)
 
-Example `watcher/adapters/typescript.adapter`:
+Example `watcher/configs/typescript.yaml`:
 
-```
+```yaml
 name: typescript
-watch: **/*.ts
-on_change: npm run build -- {path}
-notify: reload
+watch:
+	- "**/*.ts"
+on_change: "npm run build -- {path}"
+notify: "reload"
 ```
 
 Behavior:
-- If any adapter matches a changed file, the watcher runs the adapter's `on_change` (or `build`) command and follows its `notify` behavior. Multiple adapters may match and will all be executed.
-- If no adapter matches, the watcher falls back to its default heuristics (inject CSS for `.css`, reload for `.html`, or run the generic `cmd_template`).
+- If any config matches a changed file, the watcher runs the config's `on_change` (or `build`) command and follows its `notify` behavior. Multiple config files may match and will all be executed.
+- If no config matches, the watcher falls back to its default heuristics (inject CSS for `.css`, reload for `.html`, or run the generic `cmd_template`).
 
-Adapters are intentionally simple and stored as text so you can author them quickly without changing the Rust code. If you want a richer adapter language, I can extend the parser/interpreter to support variables, conditional steps, and named actions.
+Config files are intentionally simple and stored as YAML so you can author them quickly without changing the Rust code. They can also declare `ignore:` patterns that are merged into the watcher's exclude set when you don't supply a `--patterns-file`.
 
 ---
 

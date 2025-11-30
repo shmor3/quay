@@ -1,6 +1,0 @@
-
-name: docker
-watch:
-  - "Dockerfile"
-on_change: "docker build -t myapp ."
-notify: "reload"

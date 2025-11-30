@@ -1,5 +1,5 @@
 use base64::Engine;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
@@ -7,11 +7,12 @@ use serde_json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::fs;
-use std::env;
-use std::sync::OnceLock;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -25,9 +26,9 @@ struct Args {
     #[arg(default_value = "echo files changed")]
     cmd_template: String,
 
-    /// Patterns file path. Lines starting with '+' are includes, '-' are excludes. Default: .hotreloadignore in repo root
-    #[arg(long = "patterns-file")]
-    patterns_file: Option<PathBuf>,
+    /// (Deprecated) Patterns file path. Not used when `hotreload.yaml` is present.
+    // #[arg(long = "patterns-file")]
+    // patterns_file: Option<PathBuf>,
 
     /// Debounce in milliseconds
     #[arg(long = "debounce-ms", default_value_t = 200)]
@@ -41,9 +42,21 @@ struct Args {
     #[arg(long = "no-run-on-start")]
     no_run_on_start: bool,
 
-    /// Directory to load adapters from. If not provided, watcher will search common locations.
-    #[arg(long = "adapters-dir")]
-    adapters_dir: Option<PathBuf>,
+    /// Path to watch (and where to look for `hotreload.yaml`). Defaults to current directory.
+    #[arg(short = 'p', long = "path", default_value = ".")]
+    path: PathBuf,
+
+    /// Subcommands: reload or status (if omitted, run the watcher server)
+    #[command(subcommand)]
+    subcmd: Option<SubCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum SubCommand {
+    /// Force a reload (send reload to connected clients)
+    Reload,
+    /// Query status of watched configs
+    Status,
 }
 
 fn run_command_blocking(cmd: &str) {
@@ -65,30 +78,6 @@ fn run_command_blocking(cmd: &str) {
     }
 }
 
-/// Read patterns file and separate into include and exclude lists.
-/// Lines starting with '+' are includes, '-' are excludes. Lines starting with '#' are comments.
-fn read_patterns(path: &Path) -> Result<(Vec<String>, Vec<String>), std::io::Error> {
-    let s = std::fs::read_to_string(path)?;
-    let mut inc = Vec::new();
-    let mut exc = Vec::new();
-    for raw in s.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('+') {
-            inc.push(normalize_pattern(rest.trim()));
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('-') {
-            exc.push(normalize_pattern(rest.trim()));
-            continue;
-        }
-        // default to include if no prefix
-        inc.push(normalize_pattern(line));
-    }
-    Ok((inc, exc))
-}
 
 /// Build GlobSet objects from pattern lists. Returns (include_set, exclude_set) where each is Option<GlobSet>.
 fn build_globsets(inc: &Vec<String>, exc: &Vec<String>) -> (Option<GlobSet>, Option<GlobSet>) {
@@ -169,19 +158,19 @@ fn default_exclude_patterns() -> Vec<String> {
     ]
 }
 
-/// Adapter definition (parsed from pseudo-language files in adapters/)
+/// Config file definition (parsed from YAML files in configs/)
 #[derive(Debug, Clone)]
-struct Adapter {
+struct ConfigFile {
     name: String,
     watches: Vec<String>,   // glob patterns
     watch_set: Option<GlobSet>,
     on_change: Option<String>,
     build: Option<String>,
     notify: Option<String>, // 'auto', 'reload', 'inject-css', 'none'
-    // scripting removed: adapters are pure YAML configs
+    ignore: Vec<String>,    // additional exclude patterns defined in the config file
 }
 
-impl Adapter {
+impl ConfigFile {
     fn matches(&self, path: &str) -> bool {
         if let Some(gs) = &self.watch_set {
             return gs.is_match(Path::new(path));
@@ -191,65 +180,11 @@ impl Adapter {
     }
 }
 
-/// Load adapter files from `watcher/adapters` directory (relative to CWD)
-fn load_adapters(dir: &Path) -> Vec<Adapter> {
-    let mut adapters = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() {
-                if let Ok(text) = fs::read_to_string(&p) {
-                    if let Ok(mut adapter) = parse_adapter(&text) {
-                        // compile watch globs
-                        if !adapter.watches.is_empty() {
-                            let mut b = GlobSetBuilder::new();
-                            for pat in &adapter.watches {
-                                if let Ok(g) = Glob::new(pat) {
-                                    b.add(g);
-                                }
-                            }
-                            if let Ok(gs) = b.build() {
-                                adapter.watch_set = Some(gs);
-                            }
-                        }
-                        adapters.push(adapter);
-                    }
-                }
-            }
-        }
-    }
-    adapters
-}
 
-/// Find adapters directory using optional preferred path or a set of common locations.
-fn find_adapters_dir(preferred: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = preferred {
-        if p.exists() {
-            return p;
-        }
-    }
-
-    // Common candidate locations relative to current working dir
-    let candidates = vec![
-        PathBuf::from("watcher/adapters"),
-        PathBuf::from("adapters"),
-        PathBuf::from("../watcher/adapters"),
-        PathBuf::from("./watcher/adapters"),
-    ];
-
-    for c in candidates {
-        if c.exists() {
-            return c;
-        }
-    }
-
-    // fallback: use watcher/adapters even if it doesn't exist
-    PathBuf::from("watcher/adapters")
-}
 
 /// Parse adapter pseudo-language (simple key: value per line)
-fn parse_adapter(s: &str) -> Result<Adapter, &'static str> {
-    // New adapter format: YAML configuration file. Try parsing the entire file as YAML.
+fn parse_config(s: &str) -> Result<ConfigFile, &'static str> {
+    // Parse a YAML configuration file into ConfigFile struct.
     if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(s) {
         let name = val.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| "unnamed".to_string());
         let mut watches: Vec<String> = Vec::new();
@@ -267,7 +202,20 @@ fn parse_adapter(s: &str) -> Result<Adapter, &'static str> {
         let on_change = val.get("on_change").and_then(|v| v.as_str()).map(|s| s.to_string());
         let build = val.get("build").and_then(|v| v.as_str()).map(|s| s.to_string());
         let notify = val.get("notify").and_then(|v| v.as_str()).map(|s| s.to_string());
-        return Ok(Adapter { name, watches, watch_set: None, on_change, build, notify });
+        // read optional ignore list
+        let mut ignore: Vec<String> = Vec::new();
+        if let Some(iv) = val.get("ignore") {
+            if iv.is_array() {
+                for item in iv.as_array().unwrap() {
+                    if let Some(pat) = item.as_str() {
+                        ignore.push(normalize_pattern(pat));
+                    }
+                }
+            } else if let Some(pat) = iv.as_str() {
+                ignore.push(normalize_pattern(pat));
+            }
+        }
+        return Ok(ConfigFile { name, watches, watch_set: None, on_change, build, notify, ignore });
     }
 
     // Fallback: legacy key:value lines (keep compatibility)
@@ -296,7 +244,35 @@ fn parse_adapter(s: &str) -> Result<Adapter, &'static str> {
         }
     }
     let name = name.unwrap_or_else(|| "unnamed".to_string());
-    Ok(Adapter { name, watches, watch_set: None, on_change, build, notify })
+    Ok(ConfigFile { name, watches, watch_set: None, on_change, build, notify, ignore: Vec::new() })
+}
+
+/// Parse a hotreload.yaml that may contain either a single config mapping or a sequence of configs.
+fn parse_configs(s: &str) -> Vec<ConfigFile> {
+    let mut out: Vec<ConfigFile> = Vec::new();
+    if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(s) {
+        if val.is_array() {
+            for item in val.as_array().unwrap() {
+                // reuse YAML mapping parsing via serde_json::Value stringification
+                if let Ok(text) = serde_json::to_string(item) {
+                    if let Ok(cfg) = parse_config(&text) {
+                        out.push(cfg);
+                    }
+                }
+            }
+            return out;
+        } else {
+            if let Ok(cfg) = parse_config(&s) {
+                out.push(cfg);
+                return out;
+            }
+        }
+    }
+    // fallback: try legacy single config parser
+    if let Ok(cfg) = parse_config(s) {
+        out.push(cfg);
+    }
+    out
 }
 
 #[tokio::main]
@@ -308,33 +284,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cmd_template
     );
 
+    // If a subcommand was provided, act as a control client and exit
+    if let Some(sub) = &args.subcmd {
+        let control_addr = format!("127.0.0.1:{}", args.port + 1);
+        match sub {
+            SubCommand::Reload => {
+                match TcpStream::connect(&control_addr).await {
+                    Ok(mut s) => {
+                        let req = serde_json::json!({"cmd":"reload"}).to_string() + "\n";
+                        if let Err(e) = s.write_all(req.as_bytes()).await {
+                            eprintln!("failed to send reload: {}", e);
+                        }
+                        let mut buf = Vec::new();
+                        let _ = s.read_to_end(&mut buf).await;
+                        println!("{}", String::from_utf8_lossy(&buf));
+                    }
+                    Err(e) => eprintln!("failed to connect to control socket at {}: {}", control_addr, e),
+                }
+                return Ok(());
+            }
+            SubCommand::Status => {
+                match TcpStream::connect(&control_addr).await {
+                    Ok(mut s) => {
+                        let req = serde_json::json!({"cmd":"status"}).to_string() + "\n";
+                        if let Err(e) = s.write_all(req.as_bytes()).await {
+                            eprintln!("failed to send status request: {}", e);
+                        }
+                        let mut buf = Vec::new();
+                        let _ = s.read_to_end(&mut buf).await;
+                        println!("{}", String::from_utf8_lossy(&buf));
+                    }
+                    Err(e) => eprintln!("failed to connect to control socket at {}: {}", control_addr, e),
+                }
+                return Ok(());
+            }
+        }
+    }
+
     // Broadcast channel for websocket messages
     let (btx, _brx) = broadcast::channel::<String>(128);
 
-    // Load include/exclude patterns
-    let patterns_path = args
-        .patterns_file
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".hotreloadignore"));
-
-    let (include_set, exclude_set) = match read_patterns(&patterns_path) {
-        Ok((inc, exc)) => {
-            // Merge with sensible defaults for excludes
-            let mut exc = exc;
-            for d in default_exclude_patterns() {
-                if !exc.contains(&d) {
-                    exc.push(d);
+    // Determine watch root (where to look for `hotreload.yaml`) and load configs
+    let watch_root = args.path.clone();
+    let cfg_path = watch_root.join("hotreload.yaml");
+    let mut configs: Vec<ConfigFile> = Vec::new();
+    if cfg_path.exists() {
+        match fs::read_to_string(&cfg_path) {
+            Ok(text) => {
+                let parsed = parse_configs(&text);
+                for mut cfg in parsed {
+                    // compile watch globs
+                    if !cfg.watches.is_empty() {
+                        let mut b = GlobSetBuilder::new();
+                        for pat in &cfg.watches {
+                            if let Ok(g) = Glob::new(pat) {
+                                b.add(g);
+                            }
+                        }
+                        if let Ok(gs) = b.build() {
+                            cfg.watch_set = Some(gs);
+                        }
+                    }
+                    println!("hotreload-watcher: loaded config '{}' from {}", cfg.name, cfg_path.display());
+                    configs.push(cfg);
                 }
             }
-            build_globsets(&inc, &exc)
+            Err(e) => eprintln!("hotreload-watcher: failed to read {}: {}", cfg_path.display(), e),
         }
-        Err(_) => {
-            // No user patterns; use only defaults for exclude
-            let inc: Vec<String> = Vec::new();
-            let exc = default_exclude_patterns();
-            build_globsets(&inc, &exc)
+    } else {
+        println!("hotreload-watcher: no hotreload.yaml found at {}; continuing with defaults", watch_root.display());
+    }
+
+    // Build include/exclude globsets using default excludes plus any ignore entries from hotreload.yaml
+    let mut exc = default_exclude_patterns();
+    // merge ignore lists from all configs
+    for cfg in &configs {
+        for ig in &cfg.ignore {
+            if !exc.contains(ig) {
+                exc.push(ig.clone());
+            }
         }
-    };
+    }
+    let inc: Vec<String> = Vec::new();
+    let (include_set, exclude_set) = build_globsets(&inc, &exc);
 
     // Start websocket server
     let ws_addr = format!("127.0.0.1:{}", args.port);
@@ -343,6 +375,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "hotreload-watcher: websocket server listening on ws://{}",
         ws_addr
     );
+
+    // Status map for configs (shared between worker and control interface)
+    let statuses: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    for cfg in &configs {
+        statuses.lock().unwrap().insert(cfg.name.clone(), "up to date".to_string());
+    }
+
+    // Spawn a simple control TCP interface on port+1 for CLI commands (reload/status)
+    let control_addr = format!("127.0.0.1:{}", args.port + 1);
+    let ctrl_listener = TcpListener::bind(&control_addr).await?;
+    println!("hotreload-watcher: control interface listening on tcp://{}", control_addr);
+    let btx_ctrl = btx.clone();
+    let statuses_ctrl = statuses.clone();
+    tokio::spawn(async move {
+        loop {
+            match ctrl_listener.accept().await {
+                Ok((mut socket, _addr)) => {
+                    // read a single JSON command line (terminated by newline)
+                    let mut buf: Vec<u8> = Vec::new();
+                    {
+                        let mut reader = BufReader::new(&mut socket);
+                        match reader.read_until(b'\n', &mut buf).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("control read error: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let txt = String::from_utf8_lossy(&buf).to_string();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        if let Some(cmd) = v.get("cmd").and_then(|c| c.as_str()) {
+                            match cmd {
+                                "reload" => {
+                                    // send broadcast
+                                    let _ = btx_ctrl.send(serde_json::json!({"type":"reload"}).to_string());
+                                    // update statuses quickly while holding the lock briefly
+                                    {
+                                        let mut s = statuses_ctrl.lock().unwrap();
+                                        let keys: Vec<_> = s.keys().cloned().collect();
+                                        for k in &keys {
+                                            s.insert(k.clone(), "reloading".to_string());
+                                        }
+                                        for k in &keys {
+                                            s.insert(k.clone(), "up to date".to_string());
+                                        }
+                                    }
+                                    let _ = socket.write_all(b"{\"status\":\"ok\"}\n").await;
+                                }
+                                "status" => {
+                                    let reply = {
+                                        let s = statuses_ctrl.lock().unwrap();
+                                        let mut out = serde_json::Map::new();
+                                        let mut arr = Vec::new();
+                                        for (name, st) in s.iter() {
+                                            let mut m = serde_json::Map::new();
+                                            m.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                                            m.insert("status".to_string(), serde_json::Value::String(st.clone()));
+                                            arr.push(serde_json::Value::Object(m));
+                                        }
+                                        out.insert("configs".to_string(), serde_json::Value::Array(arr));
+                                        serde_json::Value::Object(out).to_string()
+                                    };
+                                    let _ = socket.write_all(reply.as_bytes()).await;
+                                    let _ = socket.write_all(b"\n").await;
+                                }
+                                _ => {
+                                    let _ = socket.write_all(b"{\"error\":\"unknown command\"}\n").await;
+                                }
+                            }
+                        } else {
+                            let _ = socket.write_all(b"{\"error\":\"bad request\"}\n").await;
+                        }
+                    } else {
+                        let _ = socket.write_all(b"{\"error\":\"invalid json\"}\n").await;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("control accept error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
     // Spawn task to accept websocket clients
     let btx_accept = btx.clone();
@@ -407,7 +524,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Config::default(),
     )?;
 
-    watcher.watch(Path::new("."), RecursiveMode::Recursive)?;
+    // watch the configured path
+    watcher.watch(&watch_root, RecursiveMode::Recursive)?;
 
     // Optionally run the command once at startup (unless disabled)
     if !args.no_run_on_start {
@@ -422,14 +540,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_set = include_set;
     let exclude_set = exclude_set;
     let debounce_ms = args.debounce_ms;
-        // determine adapters directory (allow override via CLI)
-        let adapters_dir = find_adapters_dir(args.adapters_dir.clone());
-        let adapters = load_adapters(&adapters_dir);
-        println!(
-            "hotreload-watcher: loaded {} adapters from {}",
-            adapters.len(),
-            adapters_dir.display()
-        );
+    let configs_worker = configs.clone();
+    let statuses_worker = statuses.clone();
 
         // spawn worker thread
         std::thread::spawn(move || {
@@ -467,37 +579,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             continue;
                         }
 
-                        // Adapter handling: if an adapter matches this path, run adapter logic
-                        let mut handled_by_adapter = false;
-                        for adapter in &adapters {
-                            if adapter.matches(&pnorm) {
-                                handled_by_adapter = true;
-                                println!("hotreload-watcher: adapter '{}' matched {}", adapter.name, pnorm);
-                                if let Some(cmd_tpl) = &adapter.on_change {
+                        // Config handling: check each loaded config to see if it matches this path
+                        let mut handled_by_config = false;
+                        for cfg in &configs_worker {
+                            if cfg.matches(&pnorm) {
+                                handled_by_config = true;
+                                println!("hotreload-watcher: config '{}' matched {}", cfg.name, pnorm);
+                                // set status to reloading
+                                {
+                                    let mut s = statuses_worker.lock().unwrap();
+                                    s.insert(cfg.name.clone(), "reloading".to_string());
+                                }
+
+                                if let Some(cmd_tpl) = &cfg.on_change {
                                     let cmd = cmd_tpl.replace("{path}", &pnorm);
-                                    println!("hotreload-watcher: adapter '{}' running: {}", adapter.name, cmd);
+                                    println!("hotreload-watcher: config '{}' running: {}", cfg.name, cmd);
                                     run_command_blocking(&cmd);
-                                } else if let Some(build_cmd) = &adapter.build {
+                                } else if let Some(build_cmd) = &cfg.build {
                                     let cmd = build_cmd.replace("{path}", &pnorm);
-                                    println!("hotreload-watcher: adapter '{}' building: {}", adapter.name, cmd);
+                                    println!("hotreload-watcher: config '{}' building: {}", cfg.name, cmd);
                                     run_command_blocking(&cmd);
                                 }
 
                                 // determine notification behavior
-                                let notify_mode = adapter.notify.as_deref().unwrap_or("auto");
+                                let notify_mode = cfg.notify.as_deref().unwrap_or("auto");
                                 match notify_mode {
                                     "inject-css" => {
                                         if let Ok(content) = std::fs::read(&path) {
                                             let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
                                             let msg = serde_json::json!({"type":"inject-css","path":pnorm,"content":encoded}).to_string();
                                             let _ = btx_worker.send(msg);
-                                            println!("hotreload-watcher: adapter '{}' broadcast inject-css for {}", adapter.name, pnorm);
+                                            println!("hotreload-watcher: config '{}' broadcast inject-css for {}", cfg.name, pnorm);
                                         }
                                     }
                                     "reload" => {
                                         let msg = serde_json::json!({"type":"reload"}).to_string();
                                         let _ = btx_worker.send(msg);
-                                        println!("hotreload-watcher: adapter '{}' broadcast reload for {}", adapter.name, pnorm);
+                                        println!("hotreload-watcher: config '{}' broadcast reload for {}", cfg.name, pnorm);
                                     }
                                     "auto" | _ => {
                                         // auto: reuse default extension-based behavior
@@ -507,25 +625,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                     let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
                                                     let msg = serde_json::json!({"type":"inject-css","path":pnorm,"content":encoded}).to_string();
                                                     let _ = btx_worker.send(msg);
-                                                    println!("hotreload-watcher: adapter '{}' broadcast inject-css for {}", adapter.name, pnorm);
+                                                    println!("hotreload-watcher: config '{}' broadcast inject-css for {}", cfg.name, pnorm);
                                                 }
                                             } else {
                                                 let msg = serde_json::json!({"type":"reload"}).to_string();
                                                 let _ = btx_worker.send(msg);
-                                                println!("hotreload-watcher: adapter '{}' broadcast reload for {}", adapter.name, pnorm);
+                                                println!("hotreload-watcher: config '{}' broadcast reload for {}", cfg.name, pnorm);
                                             }
                                         } else {
                                             let msg = serde_json::json!({"type":"reload"}).to_string();
                                             let _ = btx_worker.send(msg);
-                                            println!("hotreload-watcher: adapter '{}' broadcast reload for {}", adapter.name, pnorm);
+                                            println!("hotreload-watcher: config '{}' broadcast reload for {}", cfg.name, pnorm);
                                         }
                                     }
                                 }
-                                // continue to next adapter (multiple adapters may run)
+                                // mark status up to date after handling
+                                {
+                                    let mut s = statuses_worker.lock().unwrap();
+                                    s.insert(cfg.name.clone(), "up to date".to_string());
+                                }
+                                // continue to check other configs (multiple configs may apply)
                             }
                         }
 
-                        if handled_by_adapter {
+                        if handled_by_config {
                             continue;
                         }
 
@@ -618,7 +741,9 @@ mod tests {
     #[test]
     fn test_parse_adapter() {
         let s = "name: demo\nwatch: **/*.txt\non_change: echo changed {path}\nnotify: auto";
-        let a = parse_adapter(s).expect("parse");
+        let v = parse_configs(s);
+        assert_eq!(v.len(), 1);
+        let a = &v[0];
         assert_eq!(a.name, "demo");
         assert_eq!(a.watches.len(), 1);
         assert_eq!(a.on_change.as_deref(), Some("echo changed {path}"));
@@ -626,12 +751,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_adapter_json_block() {
-        let s = "name: yamldemo\nwatch:\n  - \"**/*.txt\"\non_change: \"echo yaml {path}\"\nnotify: reload";
-        let a = parse_adapter(s).expect("parse yaml");
+    fn test_parse_config_yaml() {
+        let s = "name: yamldemo\nwatch:\n  - \"**/*.txt\"\non_change: \"echo yaml {path}\"\nnotify: reload\nignore:\n  - \"target/**\"";
+        let v = parse_configs(s);
+        assert_eq!(v.len(), 1);
+        let a = &v[0];
         assert_eq!(a.name, "yamldemo");
         assert_eq!(a.watches.len(), 1);
         assert_eq!(a.on_change.as_deref(), Some("echo yaml {path}"));
         assert_eq!(a.notify.as_deref(), Some("reload"));
+        assert_eq!(a.ignore.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_multiple_configs() {
+        let s = "- name: a\n  watch:\n    - \"**/*.js\"\n- name: b\n  watch:\n    - \"**/*.css\"";
+        let v = parse_configs(s);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "a");
+        assert_eq!(v[1].name, "b");
     }
 }
