@@ -4,15 +4,15 @@ use futures::{SinkExt, StreamExt};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use serde_json;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::fs;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// Simple hotreload watcher: language-agnostic incremental builds and websocket notifications
 #[derive(Parser, Debug)]
-#[command(name = "hotreload-watcher")]
+#[command(name = "watchd")]
 struct Args {
     /// Command template to run on changes. Use {path} to substitute the changed file path.
     #[arg(default_value = "echo files changed")]
@@ -78,7 +78,6 @@ fn run_command_blocking(cmd: &str) {
     }
 }
 
-
 /// Build GlobSet objects from pattern lists. Returns (include_set, exclude_set) where each is Option<GlobSet>.
 fn build_globsets(inc: &Vec<String>, exc: &Vec<String>) -> (Option<GlobSet>, Option<GlobSet>) {
     let mut inc_set: Option<GlobSet> = None;
@@ -90,7 +89,7 @@ fn build_globsets(inc: &Vec<String>, exc: &Vec<String>) -> (Option<GlobSet>, Opt
             if let Ok(g) = Glob::new(p) {
                 b.add(g);
             } else {
-                eprintln!("hotreload-watcher: invalid include glob: {}", p);
+                eprintln!("watchd: invalid include glob: {}", p);
             }
         }
         if let Ok(gs) = b.build() {
@@ -104,7 +103,7 @@ fn build_globsets(inc: &Vec<String>, exc: &Vec<String>) -> (Option<GlobSet>, Opt
             if let Ok(g) = Glob::new(p) {
                 b.add(g);
             } else {
-                eprintln!("hotreload-watcher: invalid exclude glob: {}", p);
+                eprintln!("watchd: invalid exclude glob: {}", p);
             }
         }
         if let Ok(gs) = b.build() {
@@ -162,7 +161,7 @@ fn default_exclude_patterns() -> Vec<String> {
 #[derive(Debug, Clone)]
 struct ConfigFile {
     name: String,
-    watches: Vec<String>,   // glob patterns
+    watches: Vec<String>, // glob patterns
     watch_set: Option<GlobSet>,
     on_change: Option<String>,
     build: Option<String>,
@@ -180,13 +179,15 @@ impl ConfigFile {
     }
 }
 
-
-
 /// Parse adapter pseudo-language (simple key: value per line)
 fn parse_config(s: &str) -> Result<ConfigFile, &'static str> {
     // Parse a YAML configuration file into ConfigFile struct.
     if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(s) {
-        let name = val.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| "unnamed".to_string());
+        let name = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unnamed".to_string());
         let mut watches: Vec<String> = Vec::new();
         if let Some(wv) = val.get("watch") {
             if wv.is_array() {
@@ -199,9 +200,18 @@ fn parse_config(s: &str) -> Result<ConfigFile, &'static str> {
                 watches.push(normalize_pattern(pat));
             }
         }
-        let on_change = val.get("on_change").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let build = val.get("build").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let notify = val.get("notify").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let on_change = val
+            .get("on_change")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let build = val
+            .get("build")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let notify = val
+            .get("notify")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         // read optional ignore list
         let mut ignore: Vec<String> = Vec::new();
         if let Some(iv) = val.get("ignore") {
@@ -215,7 +225,15 @@ fn parse_config(s: &str) -> Result<ConfigFile, &'static str> {
                 ignore.push(normalize_pattern(pat));
             }
         }
-        return Ok(ConfigFile { name, watches, watch_set: None, on_change, build, notify, ignore });
+        return Ok(ConfigFile {
+            name,
+            watches,
+            watch_set: None,
+            on_change,
+            build,
+            notify,
+            ignore,
+        });
     }
 
     // Fallback: legacy key:value lines (keep compatibility)
@@ -244,7 +262,15 @@ fn parse_config(s: &str) -> Result<ConfigFile, &'static str> {
         }
     }
     let name = name.unwrap_or_else(|| "unnamed".to_string());
-    Ok(ConfigFile { name, watches, watch_set: None, on_change, build, notify, ignore: Vec::new() })
+    Ok(ConfigFile {
+        name,
+        watches,
+        watch_set: None,
+        on_change,
+        build,
+        notify,
+        ignore: Vec::new(),
+    })
 }
 
 /// Parse a hotreload.yaml that may contain either a single config mapping or a sequence of configs.
@@ -279,10 +305,7 @@ fn parse_configs(s: &str) -> Vec<ConfigFile> {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let cmd_template = args.cmd_template.clone();
-    println!(
-        "hotreload-watcher: running command on changes: {}",
-        cmd_template
-    );
+    println!("watchd: running command on changes: {}", cmd_template);
 
     // If a subcommand was provided, act as a control client and exit
     if let Some(sub) = &args.subcmd {
@@ -299,7 +322,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let _ = s.read_to_end(&mut buf).await;
                         println!("{}", String::from_utf8_lossy(&buf));
                     }
-                    Err(e) => eprintln!("failed to connect to control socket at {}: {}", control_addr, e),
+                    Err(e) => eprintln!(
+                        "failed to connect to control socket at {}: {}",
+                        control_addr, e
+                    ),
                 }
                 return Ok(());
             }
@@ -314,7 +340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let _ = s.read_to_end(&mut buf).await;
                         println!("{}", String::from_utf8_lossy(&buf));
                     }
-                    Err(e) => eprintln!("failed to connect to control socket at {}: {}", control_addr, e),
+                    Err(e) => eprintln!(
+                        "failed to connect to control socket at {}: {}",
+                        control_addr, e
+                    ),
                 }
                 return Ok(());
             }
@@ -345,14 +374,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             cfg.watch_set = Some(gs);
                         }
                     }
-                    println!("hotreload-watcher: loaded config '{}' from {}", cfg.name, cfg_path.display());
+                    println!(
+                        "watchd: loaded config '{}' from {}",
+                        cfg.name,
+                        cfg_path.display()
+                    );
                     configs.push(cfg);
                 }
             }
-            Err(e) => eprintln!("hotreload-watcher: failed to read {}: {}", cfg_path.display(), e),
+            Err(e) => eprintln!("watchd: failed to read {}: {}", cfg_path.display(), e),
         }
     } else {
-        println!("hotreload-watcher: no hotreload.yaml found at {}; continuing with defaults", watch_root.display());
+        println!(
+            "watchd: no hotreload.yaml found at {}; continuing with defaults",
+            watch_root.display()
+        );
     }
 
     // Build include/exclude globsets using default excludes plus any ignore entries from hotreload.yaml
@@ -371,21 +407,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Start websocket server
     let ws_addr = format!("127.0.0.1:{}", args.port);
     let listener = TcpListener::bind(&ws_addr).await?;
-    println!(
-        "hotreload-watcher: websocket server listening on ws://{}",
-        ws_addr
-    );
+    println!("watchd: websocket server listening on ws://{}", ws_addr);
 
     // Status map for configs (shared between worker and control interface)
-    let statuses: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let statuses: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     for cfg in &configs {
-        statuses.lock().unwrap().insert(cfg.name.clone(), "up to date".to_string());
+        statuses
+            .lock()
+            .unwrap()
+            .insert(cfg.name.clone(), "up to date".to_string());
     }
 
     // Spawn a simple control TCP interface on port+1 for CLI commands (reload/status)
     let control_addr = format!("127.0.0.1:{}", args.port + 1);
     let ctrl_listener = TcpListener::bind(&control_addr).await?;
-    println!("hotreload-watcher: control interface listening on tcp://{}", control_addr);
+    println!(
+        "watchd: control interface listening on tcp://{}",
+        control_addr
+    );
     let btx_ctrl = btx.clone();
     let statuses_ctrl = statuses.clone();
     tokio::spawn(async move {
@@ -411,7 +451,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             match cmd {
                                 "reload" => {
                                     // send broadcast
-                                    let _ = btx_ctrl.send(serde_json::json!({"type":"reload"}).to_string());
+                                    let _ = btx_ctrl
+                                        .send(serde_json::json!({"type":"reload"}).to_string());
                                     // update statuses quickly while holding the lock briefly
                                     {
                                         let mut s = statuses_ctrl.lock().unwrap();
@@ -432,18 +473,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         let mut arr = Vec::new();
                                         for (name, st) in s.iter() {
                                             let mut m = serde_json::Map::new();
-                                            m.insert("name".to_string(), serde_json::Value::String(name.clone()));
-                                            m.insert("status".to_string(), serde_json::Value::String(st.clone()));
+                                            m.insert(
+                                                "name".to_string(),
+                                                serde_json::Value::String(name.clone()),
+                                            );
+                                            m.insert(
+                                                "status".to_string(),
+                                                serde_json::Value::String(st.clone()),
+                                            );
                                             arr.push(serde_json::Value::Object(m));
                                         }
-                                        out.insert("configs".to_string(), serde_json::Value::Array(arr));
+                                        out.insert(
+                                            "configs".to_string(),
+                                            serde_json::Value::Array(arr),
+                                        );
                                         serde_json::Value::Object(out).to_string()
                                     };
                                     let _ = socket.write_all(reply.as_bytes()).await;
                                     let _ = socket.write_all(b"\n").await;
                                 }
                                 _ => {
-                                    let _ = socket.write_all(b"{\"error\":\"unknown command\"}\n").await;
+                                    let _ = socket
+                                        .write_all(b"{\"error\":\"unknown command\"}\n")
+                                        .await;
                                 }
                             }
                         } else {
@@ -466,9 +518,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // spawn a ctrl-c handler to exit gracefully
     tokio::spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            eprintln!("hotreload-watcher: failed to listen for ctrl-c: {}", e);
+            eprintln!("watchd: failed to listen for ctrl-c: {}", e);
         }
-        println!("hotreload-watcher: received ctrl-c, shutting down");
+        println!("watchd: received ctrl-c, shutting down");
         // exit process; this will terminate threads
         std::process::exit(0);
     });
@@ -481,7 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     tokio::spawn(async move {
                         match tokio_tungstenite::accept_async(stream).await {
                             Ok(ws_stream) => {
-                                println!("hotreload-watcher: ws client connected: {}", addr);
+                                println!("watchd: ws client connected: {}", addr);
                                 let (mut ws_tx, mut ws_rx) = ws_stream.split();
                                 let mut rx = peer_btx.subscribe();
 
@@ -501,7 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                                 // client disconnected; cancel send_task
                                 send_task.abort();
-                                println!("hotreload-watcher: ws client disconnected: {}", addr);
+                                println!("watchd: ws client disconnected: {}", addr);
                             }
                             Err(e) => eprintln!("ws accept error: {}", e),
                         }
@@ -543,8 +595,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let configs_worker = configs.clone();
     let statuses_worker = statuses.clone();
 
-        // spawn worker thread
-        std::thread::spawn(move || {
+    // spawn worker thread
+    std::thread::spawn(move || {
         // no embedded scripting engine; adapters are configured via YAML files
         // simple debounce map: remember last event time per path
         use std::collections::HashMap;
@@ -575,7 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         // pattern filtering: first check include/exclude rules
                         if !match_patterns(&pnorm, include_set.as_ref(), exclude_set.as_ref()) {
                             // skipped by patterns
-                            println!("hotreload-watcher: skipped by patterns: {}", pstr);
+                            println!("watchd: skipped by patterns: {}", pstr);
                             continue;
                         }
 
@@ -584,7 +636,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         for cfg in &configs_worker {
                             if cfg.matches(&pnorm) {
                                 handled_by_config = true;
-                                println!("hotreload-watcher: config '{}' matched {}", cfg.name, pnorm);
+                                println!("watchd: config '{}' matched {}", cfg.name, pnorm);
                                 // set status to reloading
                                 {
                                     let mut s = statuses_worker.lock().unwrap();
@@ -593,11 +645,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                                 if let Some(cmd_tpl) = &cfg.on_change {
                                     let cmd = cmd_tpl.replace("{path}", &pnorm);
-                                    println!("hotreload-watcher: config '{}' running: {}", cfg.name, cmd);
+                                    println!("watchd: config '{}' running: {}", cfg.name, cmd);
                                     run_command_blocking(&cmd);
                                 } else if let Some(build_cmd) = &cfg.build {
                                     let cmd = build_cmd.replace("{path}", &pnorm);
-                                    println!("hotreload-watcher: config '{}' building: {}", cfg.name, cmd);
+                                    println!("watchd: config '{}' building: {}", cfg.name, cmd);
                                     run_command_blocking(&cmd);
                                 }
 
@@ -606,36 +658,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 match notify_mode {
                                     "inject-css" => {
                                         if let Ok(content) = std::fs::read(&path) {
-                                            let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+                                            let encoded = base64::engine::general_purpose::STANDARD
+                                                .encode(&content);
                                             let msg = serde_json::json!({"type":"inject-css","path":pnorm,"content":encoded}).to_string();
                                             let _ = btx_worker.send(msg);
-                                            println!("hotreload-watcher: config '{}' broadcast inject-css for {}", cfg.name, pnorm);
+                                            println!(
+                                                "watchd: config '{}' broadcast inject-css for {}",
+                                                cfg.name, pnorm
+                                            );
                                         }
                                     }
                                     "reload" => {
                                         let msg = serde_json::json!({"type":"reload"}).to_string();
                                         let _ = btx_worker.send(msg);
-                                        println!("hotreload-watcher: config '{}' broadcast reload for {}", cfg.name, pnorm);
+                                        println!(
+                                            "watchd: config '{}' broadcast reload for {}",
+                                            cfg.name, pnorm
+                                        );
                                     }
                                     "auto" | _ => {
                                         // auto: reuse default extension-based behavior
-                                        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                                        if let Some(ext) = path.extension().and_then(|s| s.to_str())
+                                        {
                                             if ext.eq_ignore_ascii_case("css") {
                                                 if let Ok(content) = std::fs::read(&path) {
-                                                    let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+                                                    let encoded =
+                                                        base64::engine::general_purpose::STANDARD
+                                                            .encode(&content);
                                                     let msg = serde_json::json!({"type":"inject-css","path":pnorm,"content":encoded}).to_string();
                                                     let _ = btx_worker.send(msg);
-                                                    println!("hotreload-watcher: config '{}' broadcast inject-css for {}", cfg.name, pnorm);
+                                                    println!("watchd: config '{}' broadcast inject-css for {}", cfg.name, pnorm);
                                                 }
                                             } else {
-                                                let msg = serde_json::json!({"type":"reload"}).to_string();
+                                                let msg = serde_json::json!({"type":"reload"})
+                                                    .to_string();
                                                 let _ = btx_worker.send(msg);
-                                                println!("hotreload-watcher: config '{}' broadcast reload for {}", cfg.name, pnorm);
+                                                println!(
+                                                    "watchd: config '{}' broadcast reload for {}",
+                                                    cfg.name, pnorm
+                                                );
                                             }
                                         } else {
-                                            let msg = serde_json::json!({"type":"reload"}).to_string();
+                                            let msg =
+                                                serde_json::json!({"type":"reload"}).to_string();
                                             let _ = btx_worker.send(msg);
-                                            println!("hotreload-watcher: config '{}' broadcast reload for {}", cfg.name, pnorm);
+                                            println!(
+                                                "watchd: config '{}' broadcast reload for {}",
+                                                cfg.name, pnorm
+                                            );
                                         }
                                     }
                                 }
@@ -657,8 +727,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             if ext.eq_ignore_ascii_case("css") {
                                 if let Ok(content) = std::fs::read(&path) {
                                     // base64-encode content bytes to safely transport it
-                                    let encoded = base64::engine::general_purpose::STANDARD
-                                        .encode(&content);
+                                    let encoded =
+                                        base64::engine::general_purpose::STANDARD.encode(&content);
                                     let msg = serde_json::json!({
                                         "type": "inject-css",
                                         "path": pnorm,
@@ -667,7 +737,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     .to_string();
 
                                     let _ = btx_worker.send(msg);
-                                    println!("hotreload-watcher: broadcast inject-css for {}", pnorm);
+                                    println!("watchd: broadcast inject-css for {}", pnorm);
                                     continue;
                                 }
                             }
@@ -675,7 +745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             if ext.eq_ignore_ascii_case("html") {
                                 let msg = serde_json::json!({ "type": "reload" }).to_string();
                                 let _ = btx_worker.send(msg);
-                                println!("hotreload-watcher: broadcast reload for {}", pnorm);
+                                println!("watchd: broadcast reload for {}", pnorm);
                                 continue;
                             }
                         }
@@ -683,7 +753,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         // fallback: run the configured command template for this path
                         // replace {path} token in the template
                         let cmd = cmd_worker.replace("{path}", &pnorm);
-                        println!("hotreload-watcher: running: {}", cmd);
+                        println!("watchd: running: {}", cmd);
                         run_command_blocking(&cmd);
 
                         // notify clients to reload after command

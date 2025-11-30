@@ -13,9 +13,11 @@ cargo build --manifest-path watcher/Cargo.toml
 Run the watcher (example runs `npm run build` on changes):
 
 ```bash
+# run via cargo
 cargo run --manifest-path watcher/Cargo.toml -- "npm run build"
-# or run the built binary directly:
-./watcher/target/debug/hotreload-watcher "npm run build"
+
+# or run the built binary directly (watchd)
+./watcher/target/debug/watchd "npm run build"
 ```
 
 By default (no args) the watcher runs `echo files changed` on startup and when files change.

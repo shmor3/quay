@@ -1,4 +1,4 @@
-# hotreload-watcher
+# watchd
 
 A small, language-agnostic file watcher that runs commands incrementally and broadcasts changes to browser clients via WebSocket.
 
@@ -22,7 +22,11 @@ cargo build --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml
 Run (example):
 
 ```bash
+# run via cargo
 cargo run --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml -- "echo built {path}"
+
+# or run the produced binary directly (built in watcher/target/debug/watchd)
+./watcher/target/debug/watchd --path .
 ```
 
 Flags:
