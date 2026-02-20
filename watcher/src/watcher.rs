@@ -22,52 +22,19 @@ use base64::Engine;
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
 };
-use std::collections::HashMap;
 use std::panic;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-// ---------------------------------------------------------------------------
-// Shell escaping
-// ---------------------------------------------------------------------------
-
-/// Shell-escape a string so it can be safely embedded inside a command passed
-/// to `sh -c` (Unix) or `cmd /C` (Windows).
-///
-/// On Unix, the value is wrapped in single quotes with any internal single
-/// quotes replaced by the sequence `'\''` (end quote, escaped quote, start
-/// quote).
-///
-/// On Windows, the value is wrapped in double quotes with internal double
-/// quotes doubled (`"` → `""`), and `%` is escaped as `%%` to prevent
-/// environment-variable expansion.
-///
-/// This prevents command injection when a file path contains shell
-/// metacharacters (e.g. `;`, `|`, `$()`, backticks).
-pub fn shell_escape(s: &str) -> String {
-    #[cfg(target_os = "windows")]
-    {
-        // cmd.exe: wrap in double quotes, double any interior quotes, escape %.
-        let escaped = s.replace('"', "\"\"").replace('%', "%%");
-        format!("\"{}\"", escaped)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // POSIX sh: wrap in single quotes; the only character that needs
-        // special handling inside single quotes is the single quote itself.
-        let escaped = s.replace('\'', "'\\''");
-        format!("'{}'", escaped)
-    }
-}
-
+use crate::command::{run_command_blocking, shell_escape};
 use crate::config::{self, ConfigEntry, NotifyMode};
+use crate::debounce::Debouncer;
 use crate::filter::{normalize_path, PathFilter};
 use crate::kv::SharedDiffStore;
 use crate::server::{set_status, StatusMap};
@@ -77,6 +44,9 @@ use crate::server::{set_status, StatusMap};
 // ---------------------------------------------------------------------------
 
 /// Bundles all parameters needed by [`start`] to reduce argument count.
+///
+/// This struct exists to keep the [`start`] function signature manageable
+/// as the number of configuration options grows.
 pub struct WatcherParams {
     /// Root directory to watch recursively.
     pub watch_root: Box<Path>,
@@ -190,150 +160,11 @@ fn is_relevant_event(kind: &EventKind) -> bool {
 ///
 /// Errors are logged but do not propagate — a failing build command should not
 /// crash the watcher.
-pub fn run_command_blocking(cmd: &str, timeout: Option<Duration>) {
-    let result = {
-        #[cfg(target_os = "windows")]
-        {
-            Command::new("cmd").args(["/C", cmd]).spawn()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Command::new("sh").args(["-c", cmd]).spawn()
-        }
-    };
-
-    match result {
-        Ok(mut child) => {
-            if let Some(dur) = timeout {
-                // Poll-based timeout: check every 50 ms.
-                let start = Instant::now();
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            if !status.success() {
-                                warn!(
-                                    cmd,
-                                    code = status.code().unwrap_or(-1),
-                                    "command exited with non-zero status"
-                                );
-                            }
-                            break;
-                        }
-                        Ok(None) => {
-                            if start.elapsed() > dur {
-                                warn!(
-                                    cmd,
-                                    timeout_ms = dur.as_millis() as u64,
-                                    "command timed out; killing process"
-                                );
-                                let _ = child.kill();
-                                let _ = child.wait(); // reap
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        Err(e) => {
-                            error!(cmd, error = %e, "failed to poll child process");
-                            break;
-                        }
-                    }
-                }
-            } else {
-                // No timeout — block until completion.
-                match child.wait() {
-                    Ok(status) => {
-                        if !status.success() {
-                            warn!(
-                                cmd,
-                                code = status.code().unwrap_or(-1),
-                                "command exited with non-zero status"
-                            );
-                        }
-                    }
-                    Err(e) => error!(cmd, error = %e, "failed to wait on child process"),
-                }
-            }
-        }
-        Err(e) => error!(cmd, error = %e, "failed to spawn command"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Debouncer
-// ---------------------------------------------------------------------------
-
-/// A simple per-path debouncer that suppresses duplicate events within a
-/// configurable time window.
-///
-/// The internal map is periodically pruned to prevent unbounded growth during
-/// long-running sessions.
-struct Debouncer {
-    window: Duration,
-    last_seen: HashMap<String, Instant>,
-    /// Number of events processed since the last prune.
-    events_since_prune: u64,
-    /// Prune the map every N events.
-    prune_interval: u64,
-}
-
-impl Debouncer {
-    /// Create a new debouncer with the given window duration.
-    ///
-    /// A minimum window of 1 ms is enforced — a zero-duration window would
-    /// effectively disable debouncing and could cause the worker to process
-    /// the same event multiple times from backends that emit bursts.
-    fn new(window: Duration) -> Self {
-        let window = if window.is_zero() {
-            warn!("debounce window is 0ms; clamping to 1ms minimum");
-            Duration::from_millis(1)
-        } else {
-            window
-        };
-        Self {
-            window,
-            last_seen: HashMap::new(),
-            events_since_prune: 0,
-            prune_interval: 1000,
-        }
-    }
-
-    /// Returns `true` if the path should be processed (i.e. enough time has
-    /// elapsed since the last event for this path).
-    ///
-    /// Internally the map is pruned every [`prune_interval`] events to prevent
-    /// unbounded growth during long-running sessions.  Entries older than 10×
-    /// the debounce window are considered stale and removed.
-    fn should_handle(&mut self, path: &str) -> bool {
-        let now = Instant::now();
-        let dominated = match self.last_seen.get(path) {
-            Some(prev) => now.duration_since(*prev) <= self.window,
-            None => false,
-        };
-        self.last_seen.insert(path.to_string(), now);
-
-        // Periodic pruning: remove entries older than 10× the debounce window
-        // so that the map does not grow without bound in sessions that touch
-        // many distinct paths over hours/days.
-        self.events_since_prune += 1;
-        if self.events_since_prune >= self.prune_interval {
-            self.events_since_prune = 0;
-            let stale_threshold = self.window.saturating_mul(10);
-            let before = self.last_seen.len();
-            self.last_seen
-                .retain(|_, ts| now.duration_since(*ts) < stale_threshold);
-            let pruned = before.saturating_sub(self.last_seen.len());
-            if pruned > 0 {
-                debug!(
-                    pruned,
-                    remaining = self.last_seen.len(),
-                    "debouncer pruned stale entries"
-                );
-            }
-        }
-
-        !dominated
-    }
-}
+// Note: `run_command_blocking` and `shell_escape` are imported from
+// `crate::command`.  `Debouncer` is imported from `crate::debounce`.
+// These were previously defined inline in this module but have been
+// extracted to dedicated modules to eliminate duplication and improve
+// maintainability.
 
 // ---------------------------------------------------------------------------
 // Notification helpers
@@ -454,6 +285,11 @@ fn try_reload_configs(config_path: &Path) -> Option<Vec<ConfigEntry>> {
 // ---------------------------------------------------------------------------
 
 /// Context for the blocking worker thread that processes file-system events.
+///
+/// This struct encapsulates all state needed by the event loop, including
+/// the event receiver, broadcast sender, path filter, loaded configs,
+/// debouncer, and optional diff store.  It is constructed by [`start`] and
+/// moved into a dedicated OS thread.
 struct WorkerContext {
     rx: std_mpsc::Receiver<NotifyResult<Event>>,
     btx: broadcast::Sender<String>,
@@ -649,12 +485,18 @@ impl WorkerContext {
 /// This function:
 /// 1. Creates a `notify` [`RecommendedWatcher`] watching `watch_root` recursively.
 /// 2. Optionally runs the startup command (unless `skip_initial_run` is true).
-/// 3. Spawns a background **OS thread** (not a tokio task) that processes
+/// 3. Spawns a background **OS thread** (named `watchd-worker`) that processes
 ///    events in a tight loop with debouncing.
 ///
-/// The returned [`RecommendedWatcher`] must be kept alive for the duration of
-/// the program — dropping it stops file-system notifications.
-pub fn start(params: WatcherParams) -> crate::error::Result<RecommendedWatcher> {
+/// The returned tuple contains:
+/// - A [`RecommendedWatcher`] that must be kept alive for the duration of the
+///   program — dropping it stops file-system notifications.
+/// - A [`std::thread::JoinHandle`] for the worker thread, which can be
+///   monitored by the [`crate::health::WorkerWatchdog`] to detect unexpected
+///   termination.
+pub fn start(
+    params: WatcherParams,
+) -> crate::error::Result<(RecommendedWatcher, std::thread::JoinHandle<()>)> {
     let WatcherParams {
         watch_root,
         cmd_template,
@@ -715,12 +557,12 @@ pub fn start(params: WatcherParams) -> crate::error::Result<RecommendedWatcher> 
         config_path,
         diff_store,
     };
-    std::thread::Builder::new()
+    let worker_handle = std::thread::Builder::new()
         .name("watchd-worker".to_string())
         .spawn(move || ctx.run())
         .map_err(notify::Error::io)?;
 
-    Ok(watcher)
+    Ok((watcher, worker_handle))
 }
 
 // ---------------------------------------------------------------------------
@@ -730,180 +572,6 @@ pub fn start(params: WatcherParams) -> crate::error::Result<RecommendedWatcher> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- shell_escape ------------------------------------------------------
-
-    #[test]
-    fn shell_escape_normal_path() {
-        let escaped = shell_escape("src/main.rs");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"src/main.rs\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'src/main.rs'");
-    }
-
-    #[test]
-    fn shell_escape_path_with_spaces() {
-        let escaped = shell_escape("my project/file name.rs");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"my project/file name.rs\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'my project/file name.rs'");
-    }
-
-    #[test]
-    fn shell_escape_shell_metacharacters() {
-        let escaped = shell_escape("file;rm -rf /");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"file;rm -rf /\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'file;rm -rf /'");
-    }
-
-    #[test]
-    fn shell_escape_backticks_and_dollar() {
-        let escaped = shell_escape("$(whoami)`id`");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"$(whoami)`id`\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'$(whoami)`id`'");
-    }
-
-    #[test]
-    fn shell_escape_single_quotes_unix() {
-        let escaped = shell_escape("it's a file");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"it's a file\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'it'\\''s a file'");
-    }
-
-    #[test]
-    fn shell_escape_double_quotes_windows() {
-        let escaped = shell_escape("file\"name");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"file\"\"name\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'file\"name'");
-    }
-
-    #[test]
-    fn shell_escape_percent_windows() {
-        let escaped = shell_escape("100%done");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"100%%done\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'100%done'");
-    }
-
-    #[test]
-    fn shell_escape_empty_string() {
-        let escaped = shell_escape("");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "''");
-    }
-
-    #[test]
-    fn shell_escape_pipe_and_ampersand() {
-        let escaped = shell_escape("a | b && c");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"a | b && c\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'a | b && c'");
-    }
-
-    #[test]
-    fn shell_escape_newline_and_tab() {
-        let escaped = shell_escape("line1\nline2\ttab");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"line1\nline2\ttab\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'line1\nline2\ttab'");
-    }
-
-    #[test]
-    fn shell_escape_unicode_path() {
-        let escaped = shell_escape("ファイル/配置.rs");
-        #[cfg(target_os = "windows")]
-        assert_eq!(escaped, "\"ファイル/配置.rs\"");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(escaped, "'ファイル/配置.rs'");
-    }
-
-    // -- Debouncer ---------------------------------------------------------
-
-    #[test]
-    fn debouncer_allows_first_event() {
-        let mut d = Debouncer::new(Duration::from_millis(200));
-        assert!(d.should_handle("src/main.rs"));
-    }
-
-    #[test]
-    fn debouncer_suppresses_rapid_duplicates() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        assert!(d.should_handle("src/main.rs"));
-        // Second call within the window should be suppressed.
-        assert!(!d.should_handle("src/main.rs"));
-    }
-
-    #[test]
-    fn debouncer_allows_different_paths() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        assert!(d.should_handle("a.txt"));
-        assert!(d.should_handle("b.txt"));
-    }
-
-    #[test]
-    fn debouncer_prune_removes_stale_entries() {
-        let mut d = Debouncer::new(Duration::from_millis(1));
-        d.prune_interval = 2;
-
-        d.should_handle("old.txt");
-        // Sleep long enough for the entry to become stale (10× window = 10ms).
-        std::thread::sleep(Duration::from_millis(20));
-        // Trigger two more events to force a prune.
-        d.should_handle("trigger1.txt");
-        d.should_handle("trigger2.txt");
-
-        // "old.txt" should have been pruned.
-        assert!(!d.last_seen.contains_key("old.txt"));
-    }
-
-    // -- Command execution -------------------------------------------------
-
-    #[test]
-    fn run_command_blocking_handles_echo() {
-        // Just ensure it doesn't panic.
-        run_command_blocking("echo hello", None);
-    }
-
-    #[test]
-    fn run_command_blocking_respects_timeout() {
-        // A long-running command should be killed by a short timeout.
-        // We use a generous threshold so CI doesn't flake.
-        let start = Instant::now();
-        #[cfg(target_os = "windows")]
-        run_command_blocking("ping -n 10 127.0.0.1", Some(Duration::from_millis(500)));
-        #[cfg(not(target_os = "windows"))]
-        run_command_blocking("sleep 10", Some(Duration::from_millis(500)));
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "command should have been killed by timeout but ran for {:?}",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn run_command_blocking_fast_command_with_timeout() {
-        // A fast command with a long timeout should complete normally.
-        let start = Instant::now();
-        run_command_blocking("echo fast", Some(Duration::from_secs(30)));
-        let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_secs(5));
-    }
 
     // -- Event kind filtering ----------------------------------------------
 
@@ -1086,92 +754,9 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
-    // -- Debouncer additional tests ----------------------------------------
-
-    #[test]
-    fn debouncer_zero_window_clamped() {
-        // A zero-duration window should be clamped to 1ms, not disable debouncing.
-        let mut d = Debouncer::new(Duration::from_millis(0));
-        assert!(d.window >= Duration::from_millis(1));
-        // First event should still pass.
-        assert!(d.should_handle("file.txt"));
-        // Immediate second event should be suppressed (1ms window).
-        assert!(!d.should_handle("file.txt"));
-    }
-
-    #[test]
-    fn debouncer_very_large_window() {
-        let mut d = Debouncer::new(Duration::from_secs(3600)); // 1 hour
-        assert!(d.should_handle("a.txt"));
-        assert!(!d.should_handle("a.txt")); // within window
-        assert!(d.should_handle("b.txt")); // different path
-    }
-
-    #[test]
-    fn debouncer_allows_after_window_expires() {
-        let mut d = Debouncer::new(Duration::from_millis(10));
-        assert!(d.should_handle("file.rs"));
-        // Wait for the debounce window to expire.
-        std::thread::sleep(Duration::from_millis(20));
-        // Should be allowed again.
-        assert!(d.should_handle("file.rs"));
-    }
-
-    #[test]
-    fn debouncer_many_distinct_paths() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        for i in 0..1000 {
-            let path = format!("path/{}/file_{}.rs", i / 10, i);
-            assert!(d.should_handle(&path));
-        }
-        // All 1000 distinct paths should be in the map.
-        assert_eq!(d.last_seen.len(), 1000);
-    }
-
-    #[test]
-    fn debouncer_prune_actually_removes_stale() {
-        let mut d = Debouncer::new(Duration::from_millis(1));
-        d.prune_interval = 3; // prune after every 3 events
-
-        // Insert a path.
-        d.should_handle("old.txt");
-        // Sleep so it becomes stale (10× window = 10ms).
-        std::thread::sleep(Duration::from_millis(20));
-
-        // Insert 3 more events to trigger prune.
-        d.should_handle("a.txt");
-        d.should_handle("b.txt");
-        d.should_handle("c.txt");
-
-        // "old.txt" should have been pruned.
-        assert!(!d.last_seen.contains_key("old.txt"));
-        // Recent entries should remain.
-        assert!(d.last_seen.contains_key("a.txt"));
-        assert!(d.last_seen.contains_key("b.txt"));
-        assert!(d.last_seen.contains_key("c.txt"));
-    }
-
-    #[test]
-    fn debouncer_prune_keeps_recent_entries() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        d.prune_interval = 2;
-
-        d.should_handle("fresh.txt");
-        d.should_handle("trigger1.txt");
-        d.should_handle("trigger2.txt"); // triggers prune
-
-        // All entries are fresh (within 10× 10s = 100s), so none should be pruned.
-        assert!(d.last_seen.contains_key("fresh.txt"));
-        assert!(d.last_seen.contains_key("trigger1.txt"));
-        assert!(d.last_seen.contains_key("trigger2.txt"));
-    }
-
-    #[test]
-    fn debouncer_prune_interval_default() {
-        let d = Debouncer::new(Duration::from_millis(200));
-        assert_eq!(d.prune_interval, 1000);
-        assert_eq!(d.events_since_prune, 0);
-    }
+    // NOTE: Debouncer tests have been moved to `debounce.rs`.
+    // NOTE: shell_escape tests have been moved to `command.rs`.
+    // NOTE: run_command_blocking tests have been moved to `command.rs`.
 
     // -- Event kind filtering exhaustive -----------------------------------
 
@@ -1751,44 +1336,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -- run_command_blocking edge cases ------------------------------------
-
-    #[test]
-    fn run_command_blocking_nonexistent_command() {
-        // Should log an error but not panic.
-        run_command_blocking("this_command_does_not_exist_12345", None);
-    }
-
-    #[test]
-    fn run_command_blocking_empty_command() {
-        // Empty command — the shell should handle it gracefully.
-        // On some shells this is a no-op; on others it may fail.
-        // The key property is no panic.
-        run_command_blocking("", None);
-    }
-
-    #[test]
-    fn run_command_blocking_failing_command() {
-        // A command that exits with non-zero should log a warning but not panic.
-        #[cfg(target_os = "windows")]
-        run_command_blocking("cmd /C exit 1", None);
-        #[cfg(not(target_os = "windows"))]
-        run_command_blocking("false", None);
-    }
-
-    #[test]
-    fn run_command_blocking_zero_timeout() {
-        // A zero-ms timeout should still work (command likely killed immediately).
-        run_command_blocking("echo quick", Some(Duration::from_millis(0)));
-    }
-
-    #[test]
-    fn run_command_blocking_generous_timeout() {
-        // A very generous timeout with a fast command should complete normally.
-        let start = Instant::now();
-        run_command_blocking("echo hello", Some(Duration::from_secs(60)));
-        assert!(start.elapsed() < Duration::from_secs(5));
-    }
+    // NOTE: run_command_blocking edge-case tests have been moved to `command.rs`.
 
     // -- WorkerContext event processing ------------------------------------
 
@@ -2620,72 +2168,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -- Debouncer: rapid same-path suppression ----------------------------
-
-    #[test]
-    fn debouncer_rapid_same_path_only_first_passes() {
-        let mut d = Debouncer::new(Duration::from_secs(60));
-        assert!(d.should_handle("same.txt"));
-        for _ in 0..100 {
-            assert!(!d.should_handle("same.txt"));
-        }
-    }
-
-    // -- Debouncer: empty string path --------------------------------------
-
-    #[test]
-    fn debouncer_empty_path() {
-        let mut d = Debouncer::new(Duration::from_millis(200));
-        assert!(d.should_handle(""));
-        assert!(!d.should_handle(""));
-    }
-
-    // -- Debouncer: unicode path -------------------------------------------
-
-    #[test]
-    fn debouncer_unicode_path() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        assert!(d.should_handle("路径/文件.txt"));
-        assert!(!d.should_handle("路径/文件.txt"));
-        assert!(d.should_handle("дорожка/файл.txt"));
-    }
-
-    // -- Debouncer: very long path -----------------------------------------
-
-    #[test]
-    fn debouncer_very_long_path() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        let long_path = "a/".repeat(5000) + "file.txt";
-        assert!(d.should_handle(&long_path));
-        assert!(!d.should_handle(&long_path));
-    }
-
-    // -- Debouncer: paths with special characters --------------------------
-
-    #[test]
-    fn debouncer_special_chars_in_path() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        let specials = vec![
-            "file with spaces.txt",
-            "file\twith\ttabs.txt",
-            "file(1).txt",
-            "file[2].txt",
-            "file{3}.txt",
-            "file$var.txt",
-            "file#hash.txt",
-            "file@at.txt",
-            "file!bang.txt",
-            "file%percent.txt",
-        ];
-        for s in &specials {
-            assert!(d.should_handle(s), "first event for '{}' should pass", s);
-            assert!(
-                !d.should_handle(s),
-                "second event for '{}' should be suppressed",
-                s
-            );
-        }
-    }
+    // NOTE: Additional Debouncer tests have been moved to `debounce.rs`.
 
     // -- broadcast_inject_css with binary content --------------------------
 
@@ -2844,29 +2327,7 @@ mod tests {
 
     // -- run_command_blocking with path substitution -----------------------
 
-    #[test]
-    fn run_command_blocking_with_special_chars_in_args() {
-        // Command with quotes and special characters — should not panic.
-        run_command_blocking("echo \"hello world\"", None);
-        run_command_blocking("echo path/with spaces/file.txt", None);
-    }
-
-    // -- run_command_blocking timeout kills correctly ----------------------
-
-    #[test]
-    fn run_command_blocking_timeout_near_boundary() {
-        let start = Instant::now();
-        #[cfg(target_os = "windows")]
-        run_command_blocking("ping -n 100 127.0.0.1", Some(Duration::from_millis(200)));
-        #[cfg(not(target_os = "windows"))]
-        run_command_blocking("sleep 100", Some(Duration::from_millis(200)));
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "should have been killed quickly, took {:?}",
-            elapsed
-        );
-    }
+    // NOTE: run_command_blocking edge-case tests have been moved to `command.rs`.
 
     // -- WorkerContext with diff store and config --------------------------
 
@@ -3106,50 +2567,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -- Debouncer: prune with lots of paths then re-use -------------------
-
-    #[test]
-    fn debouncer_heavy_prune_then_reuse() {
-        let mut d = Debouncer::new(Duration::from_millis(1));
-        d.prune_interval = 50;
-
-        // Insert many paths.
-        for i in 0..100 {
-            d.should_handle(&format!("path_{}.txt", i));
-        }
-
-        // Sleep so all entries become stale.
-        std::thread::sleep(Duration::from_millis(20));
-
-        // Insert enough to trigger prune.
-        for i in 100..160 {
-            d.should_handle(&format!("path_{}.txt", i));
-        }
-
-        // Old entries should have been pruned.
-        assert!(
-            d.last_seen.len() < 120,
-            "stale entries should have been pruned, got {} entries",
-            d.last_seen.len()
-        );
-
-        // New entries should still be present.
-        assert!(d.last_seen.contains_key("path_159.txt"));
-    }
-
-    // -- Debouncer: window exactly at boundary -----------------------------
-
-    #[test]
-    fn debouncer_boundary_window() {
-        let mut d = Debouncer::new(Duration::from_millis(50));
-        assert!(d.should_handle("boundary.txt"));
-        // Sleep just past the window.
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(
-            d.should_handle("boundary.txt"),
-            "should pass after window expires"
-        );
-    }
+    // NOTE: Debouncer prune/boundary tests have been moved to `debounce.rs`.
 
     // -- Connection tracking: high concurrency stress ----------------------
 

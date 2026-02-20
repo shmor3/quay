@@ -4,14 +4,37 @@
 //! broadcasts reload / CSS-inject messages to browser clients via WebSocket.
 //!
 //! See the project README for full usage documentation.
+//!
+//! ## Module organisation
+//!
+//! | Module        | Responsibility                                              |
+//! |---------------|-------------------------------------------------------------|
+//! | `cli`         | Command-line argument definitions (clap)                    |
+//! | `client`      | Embedded JavaScript hot-reload client and snippet helpers   |
+//! | `command`     | Shell escaping and blocking command execution               |
+//! | `config`      | YAML config parsing with serde deserialization              |
+//! | `control`     | TCP control socket server and command handlers              |
+//! | `debounce`    | Per-path event debouncer with periodic pruning              |
+//! | `error`       | Centralised error type (`WatchdError`)                      |
+//! | `filter`      | Glob-based include/exclude path filtering                   |
+//! | `health`      | Worker thread health monitoring and self-healing            |
+//! | `kv`          | Bounded in-memory diff store for file change tracking       |
+//! | `server`      | WebSocket server and shared status-map infrastructure       |
+//! | `validate`    | Input validation helpers for CLI arguments                  |
+//! | `watcher`     | File-system watcher, event handling, and orchestration      |
 
 mod cli;
 mod client;
+mod command;
 mod config;
+mod control;
+mod debounce;
 mod error;
 mod filter;
+mod health;
 mod kv;
 mod server;
+mod validate;
 mod watcher;
 
 use clap::Parser;
@@ -48,6 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // -----------------------------------------------------------------------
+    // Input validation (beyond what clap's type system enforces)
+    // -----------------------------------------------------------------------
+    if let Err(msg) = validate::validate_bind_addr(&bind_addr) {
+        error!("{msg}");
+        std::process::exit(1);
+    }
+
+    if let Err(msg) = validate::validate_debounce_ms(args.debounce_ms) {
+        error!("{msg}");
+        std::process::exit(1);
+    }
+
+    if let Err(msg) = validate::validate_cmd_timeout_ms(args.cmd_timeout_ms) {
+        error!("{msg}");
+        std::process::exit(1);
+    }
+
+    validate::warn_port_issues(args.port);
+    validate::validate_diff_flags(args.diff, args.diff_max_file_size);
+
     // The control socket lives on port + 1.  Guard against overflow so that
     // port 65535 doesn't silently wrap to 0 (debug panic / release wrap).
     let control_port = args.port.checked_add(1).unwrap_or_else(|| {
@@ -66,19 +110,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(sub) = &args.subcmd {
         match sub {
             cli::SubCommand::Reload => {
-                if let Err(e) = server::send_reload(&control_addr).await {
+                if let Err(e) = control::send_reload(&control_addr).await {
                     error!("{e}");
                     std::process::exit(1);
                 }
             }
             cli::SubCommand::Status => {
-                if let Err(e) = server::send_status(&control_addr).await {
+                if let Err(e) = control::send_status(&control_addr).await {
                     error!("{e}");
                     std::process::exit(1);
                 }
             }
             cli::SubCommand::Diff { path } => {
-                if let Err(e) = server::send_diff(&control_addr, path.as_deref()).await {
+                if let Err(e) = control::send_diff(&control_addr, path.as_deref()).await {
                     error!("{e}");
                     std::process::exit(1);
                 }
@@ -201,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cancel.clone(),
         connection_count.clone(),
     );
-    server::spawn_control_server(
+    control::spawn_control_server(
         ctrl_listener,
         btx.clone(),
         statuses.clone(),
@@ -212,7 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Start the file-system watcher and blocking event worker.
     // We keep `_watcher` alive so that `notify` continues delivering events.
-    let _watcher = watcher::start(watcher::WatcherParams {
+    // The `worker_handle` is monitored by the health watchdog.
+    let (_watcher, worker_handle) = watcher::start(watcher::WatcherParams {
         watch_root: watch_root.into_boxed_path(),
         cmd_template,
         debounce_ms: args.debounce_ms,
@@ -226,6 +271,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         connection_count,
         diff_store,
     })?;
+
+    // Spawn the worker health watchdog.  If the worker thread terminates
+    // unexpectedly (panic, channel closure), the watchdog triggers a
+    // coordinated shutdown so the server doesn't run in a degraded state.
+    let _watchdog = health::WorkerWatchdog::new(worker_handle, cancel.clone()).spawn();
 
     // Wait for Ctrl-C to initiate graceful shutdown.
     match tokio::signal::ctrl_c().await {

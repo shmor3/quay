@@ -9,14 +9,20 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 - **WebSocket server** broadcasts `reload` and `inject-css` messages to connected browsers
 - **CSS hot-injection** — CSS changes are applied without a full page reload
 - **Embeddable JavaScript client** with automatic reconnection and exponential backoff
-- **Config hot-reload** — editing `hotreload.yaml` reloads configs without restarting the server
-- **Event kind filtering** — only data-affecting events are processed; metadata and access events are ignored
-- **Command timeout** — optional per-command timeout prevents stuck build processes
-- **Control socket** for CLI subcommands (`status`, `reload`) against a running instance
-- **Connection tracking** — active WebSocket client count reported in status responses
-- **Watch root validation** — the watch path is validated and canonicalized on startup
+- **Config hot-reload** — editing `hotreload.yaml` reloads configs automatically without restarting the server
+- **Event kind filtering** — only data-affecting events (create, modify content, remove, rename) are processed; pure metadata and access events are ignored
+- **Command timeout** — optional per-command timeout prevents stuck build processes from blocking the worker
+- **Control socket** for CLI subcommands (`status`, `reload`, `diff`) against a running instance
+- **In-memory diff store** — optionally records unified diffs for every file change, queryable via control socket
+- **Connection tracking** — active WebSocket client count is reported in status responses
+- **Watch root validation** — the watch path is validated and canonicalized on startup for clear error messages
+- **Input validation** — bind address, debounce delay, port, and timeout values are validated at startup with actionable error messages
+- **Shell escaping** — file paths interpolated into command templates are escaped to prevent command injection
+- **Sensible defaults** — common directories (`target/`, `.git/`, `node_modules/`, etc.) are excluded automatically
+- **Worker health monitoring** — a background watchdog detects if the file-watcher thread terminates unexpectedly and initiates graceful shutdown
 - **Graceful shutdown** via Ctrl-C with coordinated cancellation across all tasks
 - **Structured logging** via `tracing` (configurable with `RUST_LOG` environment variable)
+- **Self-healing** — accept errors on WebSocket and control sockets trigger a 1-second backoff and retry rather than crashing; the worker thread catches panics in individual event handlers and continues processing
 
 ## Quick start
 
@@ -39,7 +45,11 @@ Configuration is read from `hotreload.yaml` located at the watch root. See `watc
 
 The `watchd` program supports flags and subcommands. Run the watcher server (default) or invoke control subcommands which contact the running watchd control socket on port+1.
 
-### Server flags
+### Server mode (default)
+
+```
+watchd [OPTIONS] [CMD_TEMPLATE]
+```
 
 | Flag / Argument           | Default              | Description                                                       |
 |---------------------------|----------------------|-------------------------------------------------------------------|
@@ -77,6 +87,12 @@ cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project --port 3
 
 # enable the diff store to track file changes
 ./watcher/target/debug/watchd --path . --diff
+
+# enable diff with a custom max file size (1 MiB)
+./watcher/target/debug/watchd --path . --diff --diff-max-file-size 1048576
+
+# bind to all interfaces (accessible from other machines on the network)
+./watcher/target/debug/watchd --path . --bind 0.0.0.0
 
 # print the browser client snippet for embedding
 ./watcher/target/debug/watchd --print-snippet
@@ -146,6 +162,323 @@ Implementing a watchd client in any language is straightforward:
    - Unknown types → log and ignore (forward compatibility).
 5. On disconnect, reconnect with exponential backoff.
 
+## WebSocket Protocol
+
+### Messages (server → client)
+
+All messages are JSON objects with a `type` field.
+
+#### `reload`
+
+Indicates that a watched file has changed and the client should perform a full reload.
+
+```json
+{
+  "type": "reload"
+}
+```
+
+#### `inject-css`
+
+Indicates that a CSS file has changed. The new content is included as a base64-encoded string so the client can apply it without a full reload.
+
+```json
+{
+  "type": "inject-css",
+  "path": "src/styles/main.css",
+  "content": "Ym9keSB7IGJhY2tncm91bmQ6IHJlZDsgfQ=="
+}
+```
+
+| Field     | Type   | Description                              |
+|-----------|--------|------------------------------------------|
+| `type`    | string | Always `"inject-css"`                    |
+| `path`    | string | Normalised path of the changed CSS file  |
+| `content` | string | Base64-encoded CSS content               |
+
+### Messages (client → server)
+
+The server does not currently expect any messages from clients. Client frames are silently ignored. Future protocol versions may add client-to-server commands.
+
+## Control Socket Protocol
+
+The control socket listens on `port + 1` (e.g. `3013` when the WebSocket port is `3012`). It uses a simple JSON-over-TCP protocol: each connection sends one newline-terminated JSON command and receives one newline-terminated JSON response.
+
+### Supported commands
+
+| Command                              | Description                                    |
+|--------------------------------------|------------------------------------------------|
+| `{"cmd":"reload"}`                   | Broadcast a reload message, reset statuses     |
+| `{"cmd":"status"}`                   | Return config statuses and connection count    |
+| `{"cmd":"diff","path":"<path>"}`     | Return the latest diff for the given file      |
+| `{"cmd":"diffs"}`                    | List all tracked files with summary statistics |
+| `{"cmd":"diff-clear"}`              | Clear all entries from the diff store           |
+
+### Example responses
+
+**status:**
+
+```json
+{
+  "configs": [
+    { "name": "styles", "status": "up to date" },
+    { "name": "scripts", "status": "reloading" }
+  ],
+  "connections": 2
+}
+```
+
+**reload:**
+
+```json
+{ "status": "ok" }
+```
+
+**diff:**
+
+```json
+{
+  "path": "src/main.css",
+  "timestamp": 1700000000,
+  "diff": "- .old { color: red; }\n+ .new { color: blue; }\n",
+  "old_size": 24,
+  "new_size": 25,
+  "binary": false,
+  "truncated": false
+}
+```
+
+**diffs:**
+
+```json
+{
+  "summary": {
+    "tracked_files": 3,
+    "total_diffs": 7,
+    "capacity": 50,
+    "max_keys": 500,
+    "max_file_size": 524288
+  },
+  "files": [
+    {
+      "path": "src/main.css",
+      "latest_diff_size": 48,
+      "old_size": 24,
+      "new_size": 25,
+      "binary": false,
+      "truncated": false
+    }
+  ]
+}
+```
+
+### Guard rails
+
+- **Read timeout** (5 s) prevents stalled clients from holding a socket open.
+- **Size limit** (64 KiB) prevents malicious or buggy clients from sending multi-gigabyte payloads.
+- **Lock poisoning** is handled gracefully — a poisoned mutex logs a warning and returns an internal-error JSON response rather than panicking.
+- **Accept errors** trigger a 1-second backoff and retry rather than crashing.
+
+## Configuration
+
+Place a `hotreload.yaml` file in the watch root directory. It can contain a single config mapping or a YAML sequence of configs.
+
+### Config fields
+
+| Field       | Type                 | Description                                                                 |
+|-------------|----------------------|-----------------------------------------------------------------------------|
+| `name`      | `string`             | Human-readable identifier (default: `"unnamed"`)                            |
+| `watch`     | `string \| [string]` | Glob pattern(s) to match changed files                                     |
+| `on_change` | `string`             | Command template to run on change (use `{path}` placeholder)               |
+| `build`     | `string`             | Alternative build command (used when `on_change` is absent)                 |
+| `notify`    | `string`             | `auto`, `reload`, `inject-css`, or `none`                                   |
+| `ignore`    | `string \| [string]` | Additional exclude globs merged into the watcher's default excludes         |
+
+### Single config example
+
+```yaml
+name: typescript
+watch:
+  - "src/**/*.ts"
+  - "src/**/*.tsx"
+on_change: "npm run build -- {path}"
+notify: reload
+ignore:
+  - "dist/**"
+```
+
+### Multiple configs example
+
+```yaml
+- name: styles
+  watch: "src/**/*.css"
+  notify: inject-css
+
+- name: scripts
+  watch:
+    - "src/**/*.ts"
+    - "src/**/*.js"
+  on_change: "npm run build"
+  notify: reload
+```
+
+### Config hot-reload
+
+When `hotreload.yaml` itself is modified, watchd automatically reloads its config entries without requiring a server restart. The status map is updated and new configs take effect immediately.
+
+### Notification modes
+
+| Mode         | Behaviour                                                    |
+|--------------|--------------------------------------------------------------|
+| `auto`       | CSS files → inject; everything else → reload (default)       |
+| `reload`     | Always send a full-page reload                               |
+| `inject-css` | Always inject CSS content (base64-encoded over WebSocket)    |
+| `none`       | Run the command but do not notify browser clients             |
+
+### Default excludes
+
+The following patterns are always excluded unless the file matches an explicit `watch` pattern in a config:
+
+- `target/**`
+- `.git/**`
+- `node_modules/**`
+- `**/*.tmp`
+- `**/*.swp`
+- `**/.DS_Store`
+- `**/Thumbs.db`
+- `**/*.lock`
+- `**/hotreload.yaml`
+
+### Fallback behaviour
+
+When no config matches a changed file, watchd uses built-in heuristics:
+
+1. **`.css` files** → inject CSS via WebSocket (no full reload).
+2. **`.html` / `.htm` files** → broadcast a full-page reload.
+3. **All other files** → run the `CMD_TEMPLATE` positional argument (with `{path}` replaced by the shell-escaped file path) and broadcast a reload.
+
+### Event filtering
+
+Only data-affecting filesystem events are processed:
+
+| Processed               | Ignored                    |
+|-------------------------|----------------------------|
+| File created            | File accessed (read)       |
+| File content modified   | Metadata-only changes      |
+| File removed            | Permission changes         |
+| File renamed            | Timestamp-only changes     |
+
+This reduces noise and prevents unnecessary rebuilds from editors that touch file metadata without changing content.
+
+## Diff Store
+
+When started with `--diff`, watchd records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
+
+### Enabling
+
+```bash
+watchd --path . --diff
+```
+
+Optionally adjust the maximum file size (files larger than this are recorded with a placeholder instead of a real diff):
+
+```bash
+watchd --path . --diff --diff-max-file-size 1048576
+```
+
+### Querying diffs
+
+```bash
+# Latest diff for a specific file
+watchd --port 3012 diff --path src/main.css
+
+# Summary of all tracked files
+watchd --port 3012 diff
+```
+
+### Limits
+
+The diff store is bounded to prevent unbounded memory growth:
+
+- **Per-key capacity**: 50 diff entries per file (oldest evicted first)
+- **Max tracked files**: 500 distinct paths (least-recently-inserted evicted)
+- **Max file size**: 512 KiB by default (configurable with `--diff-max-file-size`)
+
+Files exceeding the size limit are recorded with a `<file too large>` placeholder and their content is not stored in memory.
+
+## Command Timeout
+
+Use `--cmd-timeout-ms` to prevent stuck build commands from blocking the worker thread indefinitely:
+
+```bash
+watchd --path . --cmd-timeout-ms 30000
+```
+
+If a command exceeds the timeout, the process is killed and the worker continues processing subsequent events. Commands that finish within the timeout are unaffected.
+
+## Security Considerations
+
+### Network exposure
+
+By default, watchd binds to `127.0.0.1` (localhost only). This means:
+
+- The WebSocket server is accessible only from the local machine.
+- The control socket is accessible only from the local machine.
+
+If you bind to `0.0.0.0` or `::`, both the WebSocket server and the control socket become accessible from other machines on the network. **Do not do this in untrusted environments** without adding an authentication layer.
+
+### Control socket authentication
+
+The control socket has **no authentication**. Any process on the local machine can send commands (reload, status, diff, diff-clear). This is acceptable for a development tool but should be considered if deploying in shared environments.
+
+### No TLS
+
+All communication (WebSocket and control socket) is unencrypted plaintext. This is appropriate for local development but should not be used over untrusted networks without a TLS-terminating proxy.
+
+### Command injection prevention
+
+File paths interpolated into command templates via the `{path}` placeholder are shell-escaped to prevent command injection. On Unix, paths are wrapped in single quotes with internal single quotes escaped. On Windows, paths are wrapped in double quotes with internal double quotes and percent signs escaped.
+
+### WebSocket handshake timeout
+
+A 10-second timeout is applied to the WebSocket handshake to prevent raw TCP connections from holding resources indefinitely.
+
+### Control socket size limit
+
+The control socket limits incoming requests to 64 KiB to prevent denial-of-service attacks via memory exhaustion.
+
+## Recovery and Self-Healing
+
+### Worker thread watchdog
+
+A background watchdog monitors the file-watcher worker thread. If the thread terminates unexpectedly (panic that escapes `catch_unwind`, channel closure, or any other fatal error), the watchdog:
+
+1. Logs the failure and any panic payload at `error` level.
+2. Triggers the cancellation token for coordinated shutdown.
+3. All server tasks (WebSocket, control socket) shut down gracefully.
+
+This prevents the server from running in a degraded state where no file changes are being detected.
+
+### Worker thread panic recovery
+
+Within the worker thread, each file-system event is processed inside `catch_unwind`. If processing a single event panics (e.g. due to a malformed path), the panic is caught, logged, and the worker continues processing subsequent events. Statistics (total events received, processed, errors, panics) are logged when the worker exits.
+
+### Accept error resilience
+
+Both the WebSocket server and control socket handle `accept()` errors (e.g. `EMFILE` — too many open files) by sleeping for 1 second and retrying, rather than crashing.
+
+### Debouncer memory management
+
+The per-path debouncer periodically prunes stale entries (older than 10× the debounce window) every 1000 events to prevent unbounded memory growth during long-running sessions.
+
+### Lock poisoning
+
+All mutex operations (status map, diff store) handle lock poisoning gracefully by logging a warning and continuing with degraded functionality rather than panicking.
+
+### Process supervisor integration
+
+For production deployments, use a process supervisor (systemd, Docker restart policy, etc.) to restart watchd automatically on exit. The watchdog ensures watchd exits cleanly when the worker thread fails, making it compatible with restart-on-exit policies.
+
 ## Logging
 
 Control verbosity with the `RUST_LOG` environment variable:
@@ -154,7 +487,7 @@ Control verbosity with the `RUST_LOG` environment variable:
 # Default (info level)
 watchd --path .
 
-# Debug output (includes skipped paths, event details)
+# Debug output (includes skipped paths, event details, debouncer activity)
 RUST_LOG=debug watchd --path .
 
 # Quiet (warnings and errors only)
@@ -165,22 +498,49 @@ RUST_LOG=warn watchd --path .
 
 The codebase is organised into focused modules:
 
-| Module       | Responsibility                                              |
-|--------------|-------------------------------------------------------------|
-| `cli.rs`     | Command-line argument definitions (clap)                    |
-| `client.rs`  | Embedded JavaScript hot-reload client and snippet helpers   |
-| `config.rs`  | YAML config parsing with serde deserialization              |
-| `error.rs`   | Centralised error type (`WatchdError`)                      |
-| `filter.rs`  | Glob-based include/exclude path filtering                   |
-| `kv.rs`      | Bounded in-memory diff store for file change tracking       |
-| `server.rs`  | WebSocket server, control socket, and client helpers        |
-| `watcher.rs` | File-system watcher, debouncing, command execution          |
-| `main.rs`    | Entry point and orchestration                               |
+| Module        | Responsibility                                              |
+|---------------|-------------------------------------------------------------|
+| `cli.rs`      | Command-line argument definitions (clap)                    |
+| `client.rs`   | Embedded JavaScript hot-reload client and snippet helpers   |
+| `command.rs`  | Shell escaping and blocking command execution               |
+| `config.rs`   | YAML config parsing with serde deserialization              |
+| `control.rs`  | TCP control socket server and command handlers              |
+| `debounce.rs` | Per-path event debouncer with periodic pruning              |
+| `error.rs`    | Centralised error type (`WatchdError`)                      |
+| `filter.rs`   | Glob-based include/exclude path filtering                   |
+| `health.rs`   | Worker thread health monitoring and self-healing            |
+| `kv.rs`       | Bounded in-memory diff store for file change tracking       |
+| `server.rs`   | WebSocket server and shared status-map infrastructure       |
+| `validate.rs` | Input validation helpers for CLI arguments                  |
+| `watcher.rs`  | File-system watcher, event handling, and orchestration      |
+| `main.rs`     | Entry point and startup orchestration                       |
 
 The `examples/` directory contains ready-to-use client implementations for
 JavaScript, Node.js, Python, Go, Rust, Ruby, and C#/.NET.
 
-See `watcher/README.md` for detailed configuration, notification modes, and extensibility documentation.
+## Extensibility
+
+This tool is intentionally language-agnostic — it does not parse or compile any language-specific files. Use `on_change` or `build` commands to invoke any build step you need:
+
+```yaml
+# Rust project
+- name: rust
+  watch: "src/**/*.rs"
+  on_change: "cargo build"
+  notify: reload
+
+# Sass compilation
+- name: sass
+  watch: "styles/**/*.scss"
+  on_change: "sass styles/main.scss public/main.css"
+  notify: inject-css
+
+# Go project with timeout
+- name: go
+  watch: "**/*.go"
+  on_change: "go build ./..."
+  notify: reload
+```
 
 ## License
 

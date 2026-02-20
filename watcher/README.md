@@ -12,28 +12,46 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 - **Config hot-reload** — editing `hotreload.yaml` reloads configs automatically without restarting the server
 - **Event kind filtering** — only data-affecting events (create, modify content, remove, rename) are processed; pure metadata and access events are ignored
 - **Command timeout** — optional per-command timeout prevents stuck build processes from blocking the worker
-- **Control socket** for CLI subcommands (`status`, `reload`) against a running instance
+- **Control socket** for CLI subcommands (`status`, `reload`, `diff`, `diffs`, `diff-clear`) against a running instance
+- **In-memory diff store** — optionally records unified diffs for every file change, queryable via control socket
 - **Connection tracking** — active WebSocket client count is reported in status responses
 - **Watch root validation** — the watch path is validated and canonicalized on startup for clear error messages
+- **Input validation** — bind address, debounce delay, port, and timeout values are validated at startup with actionable error messages
+- **Shell escaping** — file paths interpolated into command templates are escaped to prevent command injection
 - **Sensible defaults** — common directories (`target/`, `.git/`, `node_modules/`, etc.) are excluded automatically
+- **Worker health monitoring** — a background watchdog detects if the file-watcher thread terminates unexpectedly and initiates graceful shutdown
 - **Graceful shutdown** via Ctrl-C with coordinated cancellation across all tasks
 - **Structured logging** via `tracing` (configurable with `RUST_LOG` environment variable)
+- **Self-healing** — accept errors on WebSocket and control sockets trigger a 1-second backoff and retry rather than crashing; the worker thread catches panics in individual event handlers and continues processing
 
 ## Architecture
 
-The codebase is split into focused modules:
+The codebase is split into focused, single-responsibility modules:
 
-| Module       | Responsibility                                              |
-|--------------|-------------------------------------------------------------|
-| `cli.rs`     | Command-line argument definitions (clap)                    |
-| `client.rs`  | Embedded JavaScript hot-reload client and snippet helpers   |
-| `config.rs`  | YAML config parsing with serde deserialization              |
-| `error.rs`   | Centralised error type (`WatchdError`)                      |
-| `filter.rs`  | Glob-based include/exclude path filtering                   |
-| `kv.rs`      | Bounded in-memory diff store for file change tracking       |
-| `server.rs`  | WebSocket server, control socket, and client helpers        |
-| `watcher.rs` | File-system watcher, debouncing, command execution          |
-| `main.rs`    | Entry point and orchestration                               |
+| Module        | Responsibility                                                        |
+|---------------|-----------------------------------------------------------------------|
+| `cli.rs`      | Command-line argument definitions (clap derive)                       |
+| `client.rs`   | Embedded JavaScript hot-reload client and snippet helpers             |
+| `command.rs`  | Shell escaping and blocking command execution (canonical impl)        |
+| `config.rs`   | YAML config parsing with serde deserialization                        |
+| `control.rs`  | TCP control socket server, command handlers, and CLI client helpers   |
+| `debounce.rs` | Per-path event debouncer with periodic pruning                        |
+| `error.rs`    | Centralised error type (`WatchdError`) via `thiserror`                |
+| `filter.rs`   | Glob-based include/exclude path filtering                             |
+| `health.rs`   | Worker thread health monitoring / watchdog                            |
+| `kv.rs`       | Bounded in-memory diff store for file change tracking                 |
+| `server.rs`   | WebSocket server accept loop and shared status-map infrastructure     |
+| `validate.rs` | Input validation helpers for CLI arguments                            |
+| `watcher.rs`  | File-system watcher, event handling, worker context, and orchestration|
+| `main.rs`     | Entry point, startup orchestration, and module registration           |
+
+### Key design decisions
+
+- **`command.rs`** provides a single canonical `shell_escape` function used by both `config.rs` and `watcher.rs`, eliminating duplication and ensuring consistent escaping.
+- **`debounce.rs`** was extracted from `watcher.rs` for single-responsibility. It includes periodic pruning of stale entries to prevent unbounded memory growth.
+- **`control.rs`** was extracted from `server.rs` so that the WebSocket server and the control socket server each have their own module.
+- **`health.rs`** implements a `WorkerWatchdog` that monitors the worker thread `JoinHandle` and triggers coordinated shutdown if the thread dies unexpectedly.
+- **`validate.rs`** centralises input validation (bind address, debounce range, port warnings, diff flag consistency) to keep `main.rs` focused on orchestration.
 
 ## Quick start
 
@@ -131,6 +149,48 @@ If the watchd server runs on a non-default port, use the `data-port` attribute:
 - **Console logging** with coloured `[hotreload]` prefix
 - Zero external dependencies — pure vanilla JS
 
+## WebSocket Protocol
+
+Messages are JSON with a `type` field:
+
+### `reload`
+
+```json
+{"type":"reload"}
+```
+
+Instructs the client to perform a full page reload.
+
+### `inject-css`
+
+```json
+{
+  "type": "inject-css",
+  "path": "src/styles/main.css",
+  "content": "<base64-encoded CSS>"
+}
+```
+
+Instructs the client to inject or replace the CSS content without a full page reload. The `content` field is base64-encoded.
+
+## Control Socket Protocol
+
+JSON-over-TCP on port+1. One newline-terminated command per connection:
+
+| Command                              | Response                                          |
+|--------------------------------------|---------------------------------------------------|
+| `{"cmd":"status"}`                   | `{"configs":[...],"connections":N}`               |
+| `{"cmd":"reload"}`                   | `{"status":"ok"}`                                 |
+| `{"cmd":"diff","path":"<path>"}`     | Diff entry JSON or `{"error":"..."}`              |
+| `{"cmd":"diffs"}`                    | `{"summary":{...},"files":[...]}`                 |
+| `{"cmd":"diff-clear"}`              | `{"status":"ok"}`                                 |
+
+### Guard rails
+
+- **Read timeout**: 5 seconds per connection
+- **Size limit**: 64 KiB maximum request size
+- **Accept errors**: 1-second backoff and retry instead of crashing
+
 ## Diff store
 
 When started with `--diff`, watchd records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
@@ -156,16 +216,6 @@ watchd --port 3012 diff --path src/main.css
 # Summary of all tracked files
 watchd --port 3012 diff
 ```
-
-### Control socket commands
-
-When the diff store is enabled, three additional JSON commands are available on the control socket (port + 1):
-
-| Command                              | Description                                    |
-|--------------------------------------|------------------------------------------------|
-| `{"cmd":"diff","path":"<path>"}`     | Return the latest diff for the given file      |
-| `{"cmd":"diffs"}`                    | List all tracked files with summary statistics  |
-| `{"cmd":"diff-clear"}`              | Clear all entries from the diff store           |
 
 ### Limits
 
@@ -270,6 +320,24 @@ watchd --path . --cmd-timeout-ms 30000
 
 If a command exceeds the timeout, the process is killed and the worker continues processing subsequent events. Commands that finish within the timeout are unaffected.
 
+## Security considerations
+
+- **Shell escaping** — file paths are escaped before interpolation into command templates to prevent injection
+- **Local-only by default** — both the WebSocket server and control socket bind to `127.0.0.1`
+- **No authentication** — the control socket has no authentication mechanism; keep it local-only
+- **No TLS** — traffic is unencrypted; use a reverse proxy for network-exposed deployments
+- **WebSocket handshake timeout** — 10-second timeout prevents resource exhaustion from raw TCP connections
+- **Control socket size limit** — 64 KiB maximum request size prevents memory exhaustion
+
+## Recovery and self-healing
+
+- **Worker watchdog** — a background task monitors the file-watcher worker thread and initiates coordinated shutdown if it terminates unexpectedly
+- **Panic recovery** — individual event handlers are wrapped in `catch_unwind` so one bad path doesn't kill the worker
+- **Accept error resilience** — both WebSocket and control socket handle `accept()` errors with 1-second backoff and retry
+- **Debouncer pruning** — stale entries are periodically pruned to prevent unbounded memory growth
+- **Lock poisoning** — all mutex operations handle lock poisoning gracefully with warnings rather than panics
+- **Process supervisor integration** — the watchdog ensures clean exit on worker failure, compatible with systemd/Docker restart policies
+
 ## Logging
 
 Logging uses the `tracing` framework. Control verbosity with the `RUST_LOG` environment variable:
@@ -278,28 +346,11 @@ Logging uses the `tracing` framework. Control verbosity with the `RUST_LOG` envi
 # Default (info level)
 watchd --path .
 
-# Debug output (includes skipped paths, event details)
+# Debug output (includes skipped paths, event details, debouncer activity)
 RUST_LOG=debug watchd --path .
 
 # Quiet (warnings and errors only)
 RUST_LOG=warn watchd --path .
-```
-
-## Status endpoint
-
-The `watchd status` subcommand (or a direct TCP connection to the control port) returns a JSON response including:
-
-- Config names and their current state (`up to date`, `reloading`)
-- Number of active WebSocket connections
-
-```json
-{
-  "configs": [
-    { "name": "styles", "status": "up to date" },
-    { "name": "scripts", "status": "up to date" }
-  ],
-  "connections": 2
-}
 ```
 
 ## Extensibility

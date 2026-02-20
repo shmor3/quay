@@ -9,30 +9,7 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::warn;
 
-// ---------------------------------------------------------------------------
-// Shell escaping (duplicated here to avoid circular dependency with watcher)
-// ---------------------------------------------------------------------------
-
-/// Shell-escape a string so it can be safely embedded inside a command passed
-/// to `sh -c` (Unix) or `cmd /C` (Windows).
-///
-/// On Unix, the value is wrapped in single quotes with any internal single
-/// quotes replaced by the sequence `'\''`.
-///
-/// On Windows, the value is wrapped in double quotes with internal double
-/// quotes doubled and `%` escaped as `%%`.
-fn shell_escape_path(s: &str) -> String {
-    #[cfg(target_os = "windows")]
-    {
-        let escaped = s.replace('"', "\"\"").replace('%', "%%");
-        format!("\"{}\"", escaped)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let escaped = s.replace('\'', "'\\''");
-        format!("'{}'", escaped)
-    }
-}
+use crate::command::shell_escape;
 
 /// A single configuration entry parsed from `hotreload.yaml`.
 #[derive(Debug, Clone)]
@@ -174,7 +151,7 @@ impl ConfigEntry {
         self.on_change
             .as_deref()
             .or(self.build.as_deref())
-            .map(|tpl| tpl.replace("{path}", &shell_escape_path(normalized_path)))
+            .map(|tpl| tpl.replace("{path}", &shell_escape(normalized_path)))
     }
 
     /// Compiles the `watches` globs into a `GlobSet` and stores it in `watch_set`.
