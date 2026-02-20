@@ -9,6 +9,31 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::warn;
 
+// ---------------------------------------------------------------------------
+// Shell escaping (duplicated here to avoid circular dependency with watcher)
+// ---------------------------------------------------------------------------
+
+/// Shell-escape a string so it can be safely embedded inside a command passed
+/// to `sh -c` (Unix) or `cmd /C` (Windows).
+///
+/// On Unix, the value is wrapped in single quotes with any internal single
+/// quotes replaced by the sequence `'\''`.
+///
+/// On Windows, the value is wrapped in double quotes with internal double
+/// quotes doubled and `%` escaped as `%%`.
+fn shell_escape_path(s: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = s.replace('"', "\"\"").replace('%', "%%");
+        format!("\"{}\"", escaped)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let escaped = s.replace('\'', "'\\''");
+        format!("'{}'", escaped)
+    }
+}
+
 /// A single configuration entry parsed from `hotreload.yaml`.
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
@@ -142,11 +167,14 @@ impl ConfigEntry {
     }
 
     /// Returns the command to execute for a change, preferring `on_change` over `build`.
+    ///
+    /// The `{path}` placeholder is shell-escaped before substitution to
+    /// prevent command injection via crafted filenames.
     pub fn command_for(&self, normalized_path: &str) -> Option<String> {
         self.on_change
             .as_deref()
             .or(self.build.as_deref())
-            .map(|tpl| tpl.replace("{path}", normalized_path))
+            .map(|tpl| tpl.replace("{path}", &shell_escape_path(normalized_path)))
     }
 
     /// Compiles the `watches` globs into a `GlobSet` and stores it in `watch_set`.
@@ -297,20 +325,23 @@ ignore:
     fn command_for_substitution() {
         let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
         let configs = parse_configs(yaml);
-        assert_eq!(
-            configs[0].command_for("src/main.rs"),
-            Some("echo src/main.rs".to_string())
-        );
+        // Path is shell-escaped to prevent command injection.
+        let result = configs[0].command_for("src/main.rs").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"src/main.rs\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'src/main.rs'");
     }
 
     #[test]
     fn command_for_falls_back_to_build() {
         let yaml = "name: t\nwatch: \"*\"\nbuild: \"make {path}\"\n";
         let configs = parse_configs(yaml);
-        assert_eq!(
-            configs[0].command_for("foo.c"),
-            Some("make foo.c".to_string())
-        );
+        let result = configs[0].command_for("foo.c").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "make \"foo.c\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "make 'foo.c'");
     }
 
     #[test]
@@ -514,6 +545,7 @@ ignore:
     fn parse_config_on_change_takes_priority_over_build() {
         let yaml = "name: both\nwatch: \"*\"\non_change: \"npm build\"\nbuild: \"make\"\n";
         let configs = parse_configs(yaml);
+        // No {path} placeholder in the template, so output is unchanged.
         assert_eq!(configs[0].command_for("x"), Some("npm build".to_string()));
     }
 
@@ -703,27 +735,34 @@ watch:
     fn command_for_multiple_placeholders() {
         let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path} && lint {path}\"\n";
         let configs = parse_configs(yaml);
-        assert_eq!(
-            configs[0].command_for("app.js"),
-            Some("echo app.js && lint app.js".to_string())
-        );
+        let result = configs[0].command_for("app.js").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"app.js\" && lint \"app.js\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'app.js' && lint 'app.js'");
     }
 
     #[test]
     fn command_for_path_with_spaces() {
         let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
         let configs = parse_configs(yaml);
-        assert_eq!(
-            configs[0].command_for("my file.txt"),
-            Some("echo my file.txt".to_string())
-        );
+        let result = configs[0].command_for("my file.txt").unwrap();
+        // Shell escaping now wraps the path, protecting against word splitting.
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"my file.txt\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'my file.txt'");
     }
 
     #[test]
     fn command_for_empty_path() {
         let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
         let configs = parse_configs(yaml);
-        assert_eq!(configs[0].command_for(""), Some("echo ".to_string()));
+        let result = configs[0].command_for("").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo ''");
     }
 
     // -- ConfigEntry Clone -------------------------------------------------
@@ -835,5 +874,119 @@ another_extra: 42
         let yaml = "watch: \"\"\n";
         let configs = parse_configs(yaml);
         assert_eq!(configs[0].watches, vec![""]);
+    }
+
+    // -- command_for shell-escaping (injection prevention) ------------------
+
+    #[test]
+    fn command_for_escapes_semicolon_injection() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("file;rm -rf /").unwrap();
+        // The semicolon must be inside quotes, not interpreted as a command separator.
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"file;rm -rf /\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'file;rm -rf /'");
+    }
+
+    #[test]
+    fn command_for_escapes_backtick_injection() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"process {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("`whoami`").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "process \"`whoami`\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "process '`whoami`'");
+    }
+
+    #[test]
+    fn command_for_escapes_dollar_expansion() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"build {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("$(cat /etc/passwd)").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "build \"$(cat /etc/passwd)\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "build '$(cat /etc/passwd)'");
+    }
+
+    #[test]
+    fn command_for_escapes_pipe_and_ampersand() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"lint {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("a | evil && bad").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "lint \"a | evil && bad\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "lint 'a | evil && bad'");
+    }
+
+    #[test]
+    fn command_for_escapes_single_quotes() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("it's a trap").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"it's a trap\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'it'\\''s a trap'");
+    }
+
+    #[test]
+    fn command_for_escapes_double_quotes() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("say \"hello\"").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"say \"\"hello\"\"\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'say \"hello\"'");
+    }
+
+    #[test]
+    fn command_for_escapes_newlines() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("line1\nline2").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "echo \"line1\nline2\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "echo 'line1\nline2'");
+    }
+
+    #[test]
+    fn command_for_no_placeholder_unaffected_by_escaping() {
+        // When the template has no {path} placeholder, shell escaping
+        // has no effect — the command is returned as-is.
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"make all\"\n";
+        let configs = parse_configs(yaml);
+        assert_eq!(
+            configs[0].command_for("anything;dangerous"),
+            Some("make all".to_string())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn command_for_escapes_percent_on_windows() {
+        let yaml = "name: t\nwatch: \"*\"\non_change: \"echo {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("100%APPDATA%").unwrap();
+        assert_eq!(result, "echo \"100%%APPDATA%%\"");
+    }
+
+    #[test]
+    fn command_for_build_fallback_also_escapes() {
+        // Verify that when `build` is used as fallback (no on_change), the
+        // path is still shell-escaped.
+        let yaml = "name: t\nwatch: \"*\"\nbuild: \"make {path}\"\n";
+        let configs = parse_configs(yaml);
+        let result = configs[0].command_for("evil;payload").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(result, "make \"evil;payload\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(result, "make 'evil;payload'");
     }
 }

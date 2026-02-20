@@ -119,6 +119,13 @@ impl std::fmt::Debug for DiffStore {
 
 #[allow(dead_code)]
 impl DiffStore {
+    // -- Helpers -----------------------------------------------------------
+
+    /// Build the placeholder diff string used when a file exceeds the size limit.
+    fn too_large_placeholder(size: usize, limit: usize) -> String {
+        format!("<file too large: {} bytes, limit {} bytes>", size, limit)
+    }
+
     // -- Construction ------------------------------------------------------
 
     /// Create a new empty store.
@@ -174,10 +181,7 @@ impl DiffStore {
             let entry = DiffEntry {
                 path: path.to_string(),
                 timestamp: SystemTime::now(),
-                diff: format!(
-                    "<file too large: {} bytes, limit {} bytes>",
-                    new_size, self.max_file_size
-                ),
+                diff: Self::too_large_placeholder(new_size, self.max_file_size),
                 old_size,
                 new_size,
                 binary: false,
@@ -238,10 +242,7 @@ impl DiffStore {
                     let entry = DiffEntry {
                         path: normalized.to_string(),
                         timestamp: SystemTime::now(),
-                        diff: format!(
-                            "<file too large: {} bytes, limit {} bytes>",
-                            len, self.max_file_size
-                        ),
+                        diff: Self::too_large_placeholder(len, self.max_file_size),
                         old_size,
                         new_size: len,
                         binary: false,
@@ -1317,5 +1318,36 @@ mod tests {
     #[test]
     fn default_max_file_size_is_512k() {
         assert_eq!(DEFAULT_MAX_FILE_SIZE, 512 * 1024);
+    }
+
+    // -- too_large_placeholder helper --------------------------------------
+
+    #[test]
+    fn too_large_placeholder_format() {
+        let msg = DiffStore::too_large_placeholder(1024, 512);
+        assert_eq!(msg, "<file too large: 1024 bytes, limit 512 bytes>");
+    }
+
+    #[test]
+    fn too_large_placeholder_zero_values() {
+        let msg = DiffStore::too_large_placeholder(0, 0);
+        assert_eq!(msg, "<file too large: 0 bytes, limit 0 bytes>");
+    }
+
+    #[test]
+    fn too_large_placeholder_large_values() {
+        let msg = DiffStore::too_large_placeholder(10_000_000, 524_288);
+        assert!(msg.contains("10000000 bytes"));
+        assert!(msg.contains("limit 524288 bytes"));
+    }
+
+    #[test]
+    fn too_large_placeholder_matches_record_change_output() {
+        // Verify the helper produces the same string that record_change
+        // embeds in DiffEntry when content exceeds the limit.
+        let mut store = make_store_with_limit(5, 10, 16);
+        let big = vec![b'X'; 20];
+        let entry = store.record_change("f.txt", &big).unwrap();
+        assert_eq!(entry.diff, DiffStore::too_large_placeholder(20, 16));
     }
 }

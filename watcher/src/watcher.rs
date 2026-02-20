@@ -34,6 +34,39 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+// ---------------------------------------------------------------------------
+// Shell escaping
+// ---------------------------------------------------------------------------
+
+/// Shell-escape a string so it can be safely embedded inside a command passed
+/// to `sh -c` (Unix) or `cmd /C` (Windows).
+///
+/// On Unix, the value is wrapped in single quotes with any internal single
+/// quotes replaced by the sequence `'\''` (end quote, escaped quote, start
+/// quote).
+///
+/// On Windows, the value is wrapped in double quotes with internal double
+/// quotes doubled (`"` → `""`), and `%` is escaped as `%%` to prevent
+/// environment-variable expansion.
+///
+/// This prevents command injection when a file path contains shell
+/// metacharacters (e.g. `;`, `|`, `$()`, backticks).
+pub fn shell_escape(s: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        // cmd.exe: wrap in double quotes, double any interior quotes, escape %.
+        let escaped = s.replace('"', "\"\"").replace('%', "%%");
+        format!("\"{}\"", escaped)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // POSIX sh: wrap in single quotes; the only character that needs
+        // special handling inside single quotes is the single quote itself.
+        let escaped = s.replace('\'', "'\\''");
+        format!("'{}'", escaped)
+    }
+}
+
 use crate::config::{self, ConfigEntry, NotifyMode};
 use crate::filter::{normalize_path, PathFilter};
 use crate::kv::SharedDiffStore;
@@ -520,13 +553,6 @@ impl WorkerContext {
 
         let normalized = normalize_path(&raw);
 
-        // Record the diff in the KV store (if enabled).
-        if let Some(ref store) = self.diff_store {
-            if let Ok(mut guard) = store.lock() {
-                guard.record_change_from_disk(&normalized, path);
-            }
-        }
-
         // Detect config file change → hot-reload.
         if path == self.config_path.as_ref() {
             info!("hotreload.yaml changed; reloading configs");
@@ -547,6 +573,15 @@ impl WorkerContext {
         if !self.filter.is_allowed(&normalized) {
             debug!(path = %normalized, "skipped by filter");
             return;
+        }
+
+        // Record the diff in the KV store (if enabled).
+        // This is done *after* the filter check so that excluded paths
+        // (e.g. node_modules/, .git/, target/) are not recorded.
+        if let Some(ref store) = self.diff_store {
+            if let Ok(mut guard) = store.lock() {
+                guard.record_change_from_disk(&normalized, path);
+            }
         }
 
         // Try each loaded config.
@@ -595,7 +630,10 @@ impl WorkerContext {
         }
 
         // Generic fallback: run the configured command template and reload.
-        let cmd = self.cmd_template.replace("{path}", &normalized);
+        // Shell-escape the path to prevent command injection via crafted filenames.
+        let cmd = self
+            .cmd_template
+            .replace("{path}", &shell_escape(&normalized));
         info!(cmd = %cmd, "running fallback command");
         run_command_blocking(&cmd, self.cmd_timeout);
         broadcast_reload(&self.btx, &normalized, "default");
@@ -692,6 +730,107 @@ pub fn start(params: WatcherParams) -> crate::error::Result<RecommendedWatcher> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- shell_escape ------------------------------------------------------
+
+    #[test]
+    fn shell_escape_normal_path() {
+        let escaped = shell_escape("src/main.rs");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"src/main.rs\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'src/main.rs'");
+    }
+
+    #[test]
+    fn shell_escape_path_with_spaces() {
+        let escaped = shell_escape("my project/file name.rs");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"my project/file name.rs\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'my project/file name.rs'");
+    }
+
+    #[test]
+    fn shell_escape_shell_metacharacters() {
+        let escaped = shell_escape("file;rm -rf /");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"file;rm -rf /\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'file;rm -rf /'");
+    }
+
+    #[test]
+    fn shell_escape_backticks_and_dollar() {
+        let escaped = shell_escape("$(whoami)`id`");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"$(whoami)`id`\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'$(whoami)`id`'");
+    }
+
+    #[test]
+    fn shell_escape_single_quotes_unix() {
+        let escaped = shell_escape("it's a file");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"it's a file\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'it'\\''s a file'");
+    }
+
+    #[test]
+    fn shell_escape_double_quotes_windows() {
+        let escaped = shell_escape("file\"name");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"file\"\"name\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'file\"name'");
+    }
+
+    #[test]
+    fn shell_escape_percent_windows() {
+        let escaped = shell_escape("100%done");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"100%%done\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'100%done'");
+    }
+
+    #[test]
+    fn shell_escape_empty_string() {
+        let escaped = shell_escape("");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "''");
+    }
+
+    #[test]
+    fn shell_escape_pipe_and_ampersand() {
+        let escaped = shell_escape("a | b && c");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"a | b && c\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'a | b && c'");
+    }
+
+    #[test]
+    fn shell_escape_newline_and_tab() {
+        let escaped = shell_escape("line1\nline2\ttab");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"line1\nline2\ttab\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'line1\nline2\ttab'");
+    }
+
+    #[test]
+    fn shell_escape_unicode_path() {
+        let escaped = shell_escape("ファイル/配置.rs");
+        #[cfg(target_os = "windows")]
+        assert_eq!(escaped, "\"ファイル/配置.rs\"");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(escaped, "'ファイル/配置.rs'");
+    }
 
     // -- Debouncer ---------------------------------------------------------
 
@@ -3752,6 +3891,96 @@ mod tests {
         handle
             .join()
             .expect("worker should handle missing file for diff");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Diff store does NOT record filtered paths (Fix #5) ----------------
+
+    #[test]
+    fn worker_context_diff_store_skips_filtered_paths() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_diff_filtered");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Create a .tmp file that will be excluded by the filter.
+        let tmp_path = dir.join("scratch.tmp");
+        std::fs::write(&tmp_path, "temporary data").unwrap();
+
+        // Also create an allowed file for comparison.
+        let rs_path = dir.join("allowed.rs");
+        std::fs::write(&rs_path, "fn main() {}").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
+
+        // Filter that excludes *.tmp files (matches DEFAULT_EXCLUDES behaviour).
+        let filter = PathFilter::new(&[], &["**/*.tmp".to_string()]);
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter,
+            configs: vec![],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: Some(diff_store.clone()),
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send event for the filtered .tmp file.
+        let event_tmp = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![tmp_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event_tmp)).unwrap();
+
+        // Send event for the allowed .rs file.
+        let event_rs = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![rs_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event_rs)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The diff store should only have the allowed file, NOT the filtered one.
+        let guard = diff_store.lock().unwrap();
+        let keys = guard.list_keys();
+
+        // The .tmp file must not appear in the diff store.
+        for key in &keys {
+            assert!(
+                !key.ends_with(".tmp"),
+                "filtered path should NOT be in diff store, but found: {key}"
+            );
+        }
+
+        // The .rs file should be recorded.
+        let has_rs = keys.iter().any(|k| k.ends_with("allowed.rs"));
+        assert!(
+            has_rs,
+            "allowed path should be in diff store; keys: {:?}",
+            keys
+        );
+
+        drop(guard);
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

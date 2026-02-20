@@ -88,8 +88,11 @@ pub fn spawn_ws_server(
                             });
                         }
                         Err(e) => {
-                            error!(error = %e, "WebSocket listener accept error");
-                            break;
+                            error!(error = %e, "WebSocket listener accept error; retrying in 1s");
+                            // Sleep briefly to avoid a tight error loop (e.g. EMFILE),
+                            // then continue accepting instead of killing the server.
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
                         }
                     }
                 }
@@ -211,8 +214,11 @@ pub fn spawn_control_server(
                             });
                         }
                         Err(e) => {
-                            error!(error = %e, "control socket accept error");
-                            break;
+                            error!(error = %e, "control socket accept error; retrying in 1s");
+                            // Sleep briefly to avoid a tight error loop (e.g. EMFILE),
+                            // then continue accepting instead of killing the server.
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
                         }
                     }
                 }
@@ -226,6 +232,11 @@ pub fn spawn_control_server(
 /// Reads one newline-terminated JSON command, processes it, writes a response,
 /// and closes the connection.  A 5-second read timeout prevents stalled clients
 /// from holding the socket open indefinitely.
+/// Maximum number of bytes the control socket will read from a single client
+/// request before rejecting it.  This prevents a malicious or buggy client
+/// from sending a multi-gigabyte line and causing OOM.
+const CONTROL_READ_MAX_BYTES: usize = 64 * 1024; // 64 KiB
+
 async fn handle_control_client(
     mut socket: tokio::net::TcpStream,
     btx: broadcast::Sender<String>,
@@ -237,14 +248,33 @@ async fn handle_control_client(
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
     // Read with a timeout to protect against slow/malicious clients.
+    // Also cap the total bytes read to CONTROL_READ_MAX_BYTES to prevent OOM.
     let read_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut reader = BufReader::new(&mut socket);
-        reader.read_until(b'\n', &mut buf).await
+        // Wrap the socket in `take()` to enforce an upper bound on bytes read,
+        // preventing a client from sending a multi-gigabyte line before '\n'.
+        let limited = (&mut socket).take(CONTROL_READ_MAX_BYTES as u64);
+        let mut reader = BufReader::new(limited);
+        let n = reader.read_until(b'\n', &mut buf).await?;
+        // If we hit the byte limit without finding '\n', reject the request.
+        if n >= CONTROL_READ_MAX_BYTES && !buf.ends_with(b"\n") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request too large",
+            ));
+        }
+        Ok(n)
     })
     .await;
 
     match read_result {
         Ok(Ok(_)) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+            debug!("control socket request exceeded size limit");
+            let _ = socket
+                .write_all(b"{\"error\":\"request too large\"}\n")
+                .await;
+            return;
+        }
         Ok(Err(e)) => {
             debug!(error = %e, "control socket read error");
             return;
@@ -448,7 +478,20 @@ pub async fn send_diff(control_addr: &str, path: Option<&str>) -> std::result::R
         .map_err(|e| format!("failed to send diff request: {e}"))?;
 
     let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf).await;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("warning: error reading response: {e}");
+        }
+        Err(_) => {
+            eprintln!("warning: timed out reading response after 10s");
+        }
+    }
     println!("{}", String::from_utf8_lossy(&buf));
 
     Ok(())
@@ -467,7 +510,20 @@ async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), 
         .map_err(|e| format!("failed to send {cmd} request: {e}"))?;
 
     let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf).await;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("warning: error reading response: {e}");
+        }
+        Err(_) => {
+            eprintln!("warning: timed out reading response after 10s");
+        }
+    }
     println!("{}", String::from_utf8_lossy(&buf));
 
     Ok(())
@@ -1397,6 +1453,77 @@ mod tests {
         let response = control_send(&ctrl_addr, "{\"cmd\":\"status\"}\n").await;
         let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
         assert_eq!(parsed["connections"], 0);
+
+        cancel.cancel();
+    }
+
+    // -- Control socket size limit -----------------------------------------
+
+    #[tokio::test]
+    async fn control_socket_rejects_oversized_request() {
+        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+
+        // Send a request that exceeds CONTROL_READ_MAX_BYTES (64 KiB) without
+        // a newline terminator.  The server should reject it rather than OOM.
+        // We send in chunks to avoid OS send-buffer back-pressure issues.
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let chunk = vec![b'X'; 16 * 1024]; // 16 KiB per chunk
+        for _ in 0..8 {
+            // 8 × 16 KiB = 128 KiB total
+            if stream.write_all(&chunk).await.is_err() {
+                // Server may have closed the connection early — that's fine,
+                // it means it rejected the oversized request.
+                break;
+            }
+        }
+
+        // Give the server time to process and respond.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Shut down write half so read_to_end completes.
+        let _ = stream.shutdown().await;
+
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut buf),
+        )
+        .await;
+
+        let response = String::from_utf8_lossy(&buf);
+        // The server should respond with an error (either "request too large"
+        // or "invalid json" if it read a partial chunk), OR the connection may
+        // have been reset.  The key property is that the server does NOT hang,
+        // crash, or consume unbounded memory.
+        //
+        // On some platforms the server closes the connection before we read,
+        // yielding an empty response — that is also acceptable.
+        if !response.is_empty() {
+            assert!(
+                response.contains("error"),
+                "expected error response for oversized request, got: {response}"
+            );
+        }
+
+        // Verify the server is still alive by sending a normal request.
+        let followup = control_send(&addr, "{\"cmd\":\"status\"}\n").await;
+        let parsed: serde_json::Value = serde_json::from_str(followup.trim()).unwrap();
+        assert!(
+            parsed.get("configs").is_some(),
+            "server should still be functional after rejecting oversized request"
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn control_socket_accepts_request_under_limit() {
+        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+
+        // A normal-sized request should still work fine.
+        let response = control_send(&addr, "{\"cmd\":\"status\"}\n").await;
+        let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert!(parsed.get("configs").is_some());
 
         cancel.cancel();
     }
