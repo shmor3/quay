@@ -1,164 +1,276 @@
 # watchd
 
-A small, language-agnostic file watcher that runs commands incrementally and broadcasts changes to browser clients via WebSocket.
+A minimal, language-agnostic file watcher that runs commands when files change and broadcasts reload or CSS-inject messages to browser clients via WebSocket.
 
 ## Features
 
-- Watch the current directory recursively
-- Run a command template on changes (use `{path}` to substitute the changed path)
-- Broadcast messages to connected browsers to inject CSS (`inject-css`) or request a full reload (`reload`)
-- Include/exclude pattern file support with `+` (include) and `-` (exclude) prefixes
-- Sensible default excludes: `target/**`, `.git/**`, `node_modules/**`, etc.
-- Configurable debounce, websocket port, and option to skip initial run
+- **Recursive directory watching** with configurable debounce
+- **YAML-based configuration** (`hotreload.yaml`) for per-project build/run logic
+- **WebSocket server** broadcasts `reload` and `inject-css` messages to connected browsers
+- **CSS hot-injection** — CSS changes are applied without a full page reload
+- **Embeddable JavaScript client** with automatic reconnection and exponential backoff
+- **Config hot-reload** — editing `hotreload.yaml` reloads configs automatically without restarting the server
+- **Event kind filtering** — only data-affecting events (create, modify content, remove, rename) are processed; pure metadata and access events are ignored
+- **Command timeout** — optional per-command timeout prevents stuck build processes from blocking the worker
+- **Control socket** for CLI subcommands (`status`, `reload`) against a running instance
+- **Connection tracking** — active WebSocket client count is reported in status responses
+- **Watch root validation** — the watch path is validated and canonicalized on startup for clear error messages
+- **Sensible defaults** — common directories (`target/`, `.git/`, `node_modules/`, etc.) are excluded automatically
+- **Graceful shutdown** via Ctrl-C with coordinated cancellation across all tasks
+- **Structured logging** via `tracing` (configurable with `RUST_LOG` environment variable)
+
+## Architecture
+
+The codebase is split into focused modules:
+
+| Module       | Responsibility                                              |
+|--------------|-------------------------------------------------------------|
+| `cli.rs`     | Command-line argument definitions (clap)                    |
+| `client.rs`  | Embedded JavaScript hot-reload client and snippet helpers   |
+| `config.rs`  | YAML config parsing with serde deserialization              |
+| `error.rs`   | Centralised error type (`WatchdError`)                      |
+| `filter.rs`  | Glob-based include/exclude path filtering                   |
+| `server.rs`  | WebSocket server, control socket, and client helpers        |
+| `watcher.rs` | File-system watcher, debouncing, command execution          |
+| `main.rs`    | Entry point and orchestration                               |
 
 ## Quick start
 
 Build:
 
 ```bash
-cargo build --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml
+cargo build --manifest-path watcher/Cargo.toml
 ```
 
-Run (example):
+Run the watcher server:
 
 ```bash
-# run via cargo
-cargo run --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml -- "echo built {path}"
+# via cargo
+cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project
 
-# or run the produced binary directly (built in watcher/target/debug/watchd)
+# or run the produced binary directly
 ./watcher/target/debug/watchd --path .
 ```
 
-Flags:
+## CLI reference
 
-- `--patterns-file <path>` : path to patterns file (default `.hotreloadignore`)
-- `--debounce-ms <ms>` : debounce delay in milliseconds (default `200`)
-- `--port <port>` : websocket port (default `3012`)
-- `--no-run-on-start` : do not run command on startup
+### Server mode (default)
 
-## Patterns file (.hotreloadignore)
+```
+watchd [OPTIONS] [CMD_TEMPLATE]
+```
 
-Create a `.hotreloadignore` file in the repo root or pass a different file with `--patterns-file`.
+| Flag / Argument           | Default              | Description                                                       |
+|---------------------------|----------------------|-------------------------------------------------------------------|
+| `[CMD_TEMPLATE]`          | `echo files changed` | Command to run on changes. Use `{path}` for the changed file path |
+| `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `hotreload.yaml`         |
+| `--port <PORT>`           | `3012`               | WebSocket server port                                             |
+| `--bind <ADDR>`           | `127.0.0.1`          | Address to bind the WebSocket and control servers to              |
+| `--debounce-ms <MS>`      | `200`                | Debounce delay in milliseconds                                    |
+| `--no-run-on-start`       |                      | Do not run configured commands on startup                         |
+| `--cmd-timeout-ms <MS>`   |                      | Maximum time to wait for a command before killing it              |
+| `--print-snippet`         |                      | Print the HTML `<script>` snippet for embedding the client, then exit |
 
-Syntax:
+### Client-mode subcommands
 
-- Lines starting with `+` are include patterns (glob syntax)
-# watchd
-
-A small, language-agnostic file watcher that runs commands incrementally and broadcasts changes to browser clients via WebSocket.
-
-## Features
-
-- Watch the current directory recursively
-- Run a command template on changes (use `{path}` to substitute the changed path)
-- Broadcast messages to connected browsers to inject CSS (`inject-css`) or request a full reload (`reload`)
-- Include/exclude pattern file support with `+` (include) and `-` (exclude) prefixes
-- Sensible default excludes: `target/**`, `.git/**`, `node_modules/**`, etc.
-- Configurable debounce, websocket port, and option to skip initial run
-
-## Quick start
-
-Build:
+These contact the running `watchd` instance via the control socket (port + 1):
 
 ```bash
-cargo build --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml
+# Query status of loaded configs and active connections
+watchd --port 3012 status
+
+# Trigger an immediate reload
+watchd --port 3012 reload
 ```
 
-Run (example):
+## Browser client
+
+The `watchd` server broadcasts WebSocket messages, but your HTML pages need a small client script to receive them. There are several ways to add it:
+
+### Option 1 — Print the snippet
+
+Use the `--print-snippet` flag to output a ready-to-paste `<script>` tag:
 
 ```bash
-# run via cargo
-cargo run --manifest-path d:/GitHub/hotreload/watcher/Cargo.toml -- "echo built {path}"
-
-# or run the produced binary directly (built in watcher/target/debug/watchd)
-./watcher/target/debug/watchd --path .
+watchd --port 3012 --print-snippet
 ```
 
-Flags:
+This outputs both an inline `<script>` version (zero extra requests) and an external `<script src>` version.
 
-- `--patterns-file <path>` : path to patterns file (default `.hotreloadignore`)
-- `--debounce-ms <ms>` : debounce delay in milliseconds (default `200`)
-- `--port <port>` : websocket port (default `3012`)
-- `--no-run-on-start` : do not run command on startup
+### Option 2 — Serve the standalone file
 
-## Patterns file (.hotreloadignore)
-
-Create a `.hotreloadignore` file in the repo root or pass a different file with `--patterns-file`.
-
-Syntax:
-
-- Lines starting with `+` are include patterns (glob syntax)
-- Lines starting with `-` are exclude patterns
-- Lines starting with `#` are comments
-- Blank lines are ignored
-- Lines without a prefix default to include
-
-Example:
-
-```text
-# include source and static assets
-+ src/**
-+ static/**/*.css
-
-# exclude build artifacts
-- target/**
-- .git/**
-- node_modules/**
-```
-
-Note: exclude patterns are always honored; if include patterns exist, a file must match at least one include to be considered.
-
-## Client
-
-Include `hotreload-client.js` in your HTML pages to receive live updates:
+Copy `hotreload-client.js` from this repository into your project's static assets and include it:
 
 ```html
 <script src="/hotreload-client.js"></script>
 ```
 
-The client connects to `ws://<host>:3012` by default and will:
+### Option 3 — Override the port
 
-- Inject CSS sent as `inject-css` messages by replacing/creating a `<style data-hotreload="...">` element
-- Reload the page when a `reload` message is broadcast
+If the watchd server runs on a non-default port, use the `data-port` attribute:
 
-## Extensibility
+```html
+<script src="/hotreload-client.js" data-port="4000"></script>
+```
 
-This tool is intentionally language-agnostic: it doesn't parse or compile language-specific files. Use the `cmd_template` to invoke any build step you need (e.g., `npm run build -- {path}` or `cargo build --manifest-path project/Cargo.toml`).
+### Client features
 
-If you'd like, I can add:
+- **Auto-reconnect** with exponential backoff (1 s → 30 s cap)
+- **Full page reload** on `reload` messages
+- **CSS hot-injection** on `inject-css` messages — injects or updates `<style data-hotreload="...">` elements
+- **Cache-busting** of `<link rel="stylesheet">` elements whose `href` matches the changed path
+- **Console logging** with coloured `[hotreload]` prefix
+- Zero external dependencies — pure vanilla JS
 
-- .gitignore-like order/negation semantics for patterns
-- Default merge behavior that allows user overrides
-- Tests for Windows path normalization and UNC paths
+## Configuration
 
-## Config files
+Place a `hotreload.yaml` file in the watch root directory. It can contain a single config mapping or a YAML sequence of configs.
 
-You can add config files — small YAML files placed in `watcher/configs/` (or `configs/`) — to provide project- or language-specific build/run logic. The watcher will load any config files it finds at startup and use them when a matching file changes.
+### Config fields
 
-Config syntax (YAML):
+| Field       | Type                 | Description                                                                 |
+|-------------|----------------------|-----------------------------------------------------------------------------|
+| `name`      | `string`             | Human-readable identifier (default: `"unnamed"`)                            |
+| `watch`     | `string \| [string]` | Glob pattern(s) to match changed files                                     |
+| `on_change` | `string`             | Command template to run on change (use `{path}` placeholder)               |
+| `build`     | `string`             | Alternative build command (used when `on_change` is absent)                 |
+| `notify`    | `string`             | `auto`, `reload`, `inject-css`, or `none`                                   |
+| `ignore`    | `string \| [string]` | Additional exclude globs merged into the watcher's default excludes         |
 
-- `name: <identifier>` — config name
-- `watch:` — a glob or sequence of globs to match changed files (e.g., `"**/*.ts"`)
-- `on_change: <cmd>` — command template to run when a matching file changes (use `{path}`)
-- `build: <cmd>` — alternative build command
-- `notify: <auto|reload|inject-css|none>` — how to notify clients; `auto` uses extension heuristics
-- `ignore:` — optional list of exclude globs that will be merged into the watcher's exclude set (used when no `--patterns-file` is supplied)
-
-Example `watcher/configs/typescript.yaml`:
+### Single config example
 
 ```yaml
 name: typescript
 watch:
-  - "**/*.ts"
+  - "src/**/*.ts"
+  - "src/**/*.tsx"
 on_change: "npm run build -- {path}"
-notify: "reload"
+notify: reload
+ignore:
+  - "dist/**"
 ```
 
-Behavior:
+### Multiple configs example
 
-- If any config matches a changed file, the watcher runs the config's `on_change` (or `build`) command and follows its `notify` behavior. Multiple config files may match and will all be executed.
-- If no config matches, the watcher falls back to its default heuristics (inject CSS for `.css`, reload for `.html`, or run the generic `cmd_template`).
+```yaml
+- name: styles
+  watch: "src/**/*.css"
+  notify: inject-css
 
----
+- name: scripts
+  watch:
+    - "src/**/*.ts"
+    - "src/**/*.js"
+  on_change: "npm run build"
+  notify: reload
+```
 
-If you'd like me to make any of the above improvements (or implement a config file format), tell me which and I'll continue.
+### Config hot-reload
+
+When `hotreload.yaml` itself is modified, watchd automatically reloads its config entries without requiring a server restart. The status map is updated and new configs take effect immediately.
+
+### Notification modes
+
+| Mode         | Behaviour                                                    |
+|--------------|--------------------------------------------------------------|
+| `auto`       | CSS files → inject; everything else → reload (default)       |
+| `reload`     | Always send a full-page reload                               |
+| `inject-css` | Always inject CSS content (base64-encoded over WebSocket)    |
+| `none`       | Run the command but do not notify browser clients             |
+
+### Default excludes
+
+The following patterns are always excluded unless the file matches an explicit `watch` pattern in a config:
+
+- `target/**`
+- `.git/**`
+- `node_modules/**`
+- `**/*.tmp`
+- `**/*.swp`
+- `**/.DS_Store`
+- `**/Thumbs.db`
+- `**/*.lock`
+- `**/hotreload.yaml`
+
+### Event filtering
+
+Only data-affecting filesystem events are processed:
+
+| Processed               | Ignored                    |
+|-------------------------|----------------------------|
+| File created            | File accessed (read)       |
+| File content modified   | Metadata-only changes      |
+| File removed            | Permission changes         |
+| File renamed            | Timestamp-only changes     |
+
+This reduces noise and prevents unnecessary rebuilds from editors that touch file metadata without changing content.
+
+## Command timeout
+
+Use `--cmd-timeout-ms` to prevent stuck build commands from blocking the worker thread indefinitely:
+
+```bash
+watchd --path . --cmd-timeout-ms 30000
+```
+
+If a command exceeds the timeout, the process is killed and the worker continues processing subsequent events. Commands that finish within the timeout are unaffected.
+
+## Logging
+
+Logging uses the `tracing` framework. Control verbosity with the `RUST_LOG` environment variable:
+
+```bash
+# Default (info level)
+watchd --path .
+
+# Debug output (includes skipped paths, event details)
+RUST_LOG=debug watchd --path .
+
+# Quiet (warnings and errors only)
+RUST_LOG=warn watchd --path .
+```
+
+## Status endpoint
+
+The `watchd status` subcommand (or a direct TCP connection to the control port) returns a JSON response including:
+
+- Config names and their current state (`up to date`, `reloading`)
+- Number of active WebSocket connections
+
+```json
+{
+  "configs": [
+    { "name": "styles", "status": "up to date" },
+    { "name": "scripts", "status": "up to date" }
+  ],
+  "connections": 2
+}
+```
+
+## Extensibility
+
+This tool is intentionally language-agnostic — it does not parse or compile any language-specific files. Use `on_change` or `build` commands to invoke any build step you need:
+
+```yaml
+# Rust project
+- name: rust
+  watch: "src/**/*.rs"
+  on_change: "cargo build"
+  notify: reload
+
+# Sass compilation
+- name: sass
+  watch: "styles/**/*.scss"
+  on_change: "sass styles/main.scss public/main.css"
+  notify: inject-css
+
+# Go project with timeout
+- name: go
+  watch: "**/*.go"
+  on_change: "go build ./..."
+  notify: reload
+```
+
+## License
+
+MIT
