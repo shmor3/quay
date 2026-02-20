@@ -10,6 +10,7 @@ mod client;
 mod config;
 mod error;
 mod filter;
+mod kv;
 mod server;
 mod watcher;
 
@@ -70,6 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             cli::SubCommand::Status => {
                 if let Err(e) = server::send_status(&control_addr).await {
+                    error!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            cli::SubCommand::Diff { path } => {
+                if let Err(e) = server::send_diff(&control_addr, path.as_deref()).await {
                     error!("{e}");
                     std::process::exit(1);
                 }
@@ -140,6 +147,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect();
     let path_filter = filter::PathFilter::with_defaults(&extra_excludes);
 
+    // Optionally create the diff store (enabled by --diff).
+    let diff_store = if args.diff {
+        let store = kv::DiffStore::new_shared(50, 500, args.diff_max_file_size);
+        info!(
+            max_file_size = args.diff_max_file_size,
+            "diff store enabled"
+        );
+        Some(store)
+    } else {
+        None
+    };
+
     // Broadcast channel for WebSocket messages.
     let (btx, _brx) = broadcast::channel::<String>(256);
 
@@ -186,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         statuses.clone(),
         cancel.clone(),
         connection_count.clone(),
+        diff_store.clone(),
     );
 
     // Start the file-system watcher and blocking event worker.
@@ -202,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cancel: cancel.clone(),
         cmd_timeout_ms: args.cmd_timeout_ms,
         connection_count,
+        diff_store,
     })?;
 
     // Wait for Ctrl-C to initiate graceful shutdown.

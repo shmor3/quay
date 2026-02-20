@@ -4,8 +4,14 @@
 //! (reload / inject-css) to all connected peers.
 //!
 //! The control socket provides a simple JSON-over-TCP protocol so that CLI
-//! subcommands (`watchd reload`, `watchd status`) can interact with the running
-//! server.
+//! subcommands (`watchd reload`, `watchd status`, `watchd diff`) can interact
+//! with the running server.
+//!
+//! When the diff store is enabled (`--diff`), additional control commands are
+//! available:
+//! - `{"cmd":"diff","path":"<path>"}` – latest diff for a file
+//! - `{"cmd":"diffs"}` – summary of all tracked files
+//! - `{"cmd":"diff-clear"}` – clear the diff store
 
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -18,6 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::kv::SharedDiffStore;
 use crate::watcher;
 
 /// Shared status map tracking the state of each loaded config.
@@ -181,6 +188,7 @@ pub fn spawn_control_server(
     statuses: StatusMap,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
+    diff_store: Option<SharedDiffStore>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -197,8 +205,9 @@ pub fn spawn_control_server(
                             let statuses = statuses.clone();
                             let cancel = cancel.clone();
                             let counter = connection_count.clone();
+                            let diff_store = diff_store.clone();
                             tokio::spawn(async move {
-                                handle_control_client(socket, btx, statuses, cancel, counter).await;
+                                handle_control_client(socket, btx, statuses, cancel, counter, diff_store).await;
                             });
                         }
                         Err(e) => {
@@ -223,6 +232,7 @@ async fn handle_control_client(
     statuses: StatusMap,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
+    diff_store: Option<SharedDiffStore>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
@@ -251,6 +261,12 @@ async fn handle_control_client(
         Ok(v) => match v.get("cmd").and_then(|c| c.as_str()) {
             Some("reload") => handle_reload_cmd(&btx, &statuses),
             Some("status") => handle_status_cmd(&statuses, &connection_count),
+            Some("diff") => {
+                let path = v.get("path").and_then(|p| p.as_str());
+                handle_diff_cmd(&diff_store, path)
+            }
+            Some("diffs") => handle_diffs_cmd(&diff_store),
+            Some("diff-clear") => handle_diff_clear_cmd(&diff_store),
             Some(other) => {
                 warn!(cmd = other, "unknown control command");
                 "{\"error\":\"unknown command\"}\n".to_string()
@@ -304,6 +320,105 @@ fn handle_status_cmd(statuses: &StatusMap, connection_count: &Arc<AtomicUsize>) 
 // Client helpers (used by `watchd reload` / `watchd status` subcommands)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Diff store command handlers
+// ---------------------------------------------------------------------------
+
+/// Process a `diff` command: return the latest diff for a specific file path.
+fn handle_diff_cmd(diff_store: &Option<SharedDiffStore>, path: Option<&str>) -> String {
+    let store = match diff_store {
+        Some(s) => s,
+        None => return "{\"error\":\"diff store not enabled (start with --diff)\"}\n".to_string(),
+    };
+
+    let path = match path {
+        Some(p) => p,
+        None => return "{\"error\":\"missing 'path' field\"}\n".to_string(),
+    };
+
+    let guard = match store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            warn!("diff store lock poisoned");
+            return "{\"error\":\"internal error\"}\n".to_string();
+        }
+    };
+
+    match guard.get_latest(path) {
+        Some(entry) => {
+            let body = entry.to_json();
+            format!("{body}\n")
+        }
+        None => {
+            let body = serde_json::json!({"error": "no diff found", "path": path});
+            format!("{body}\n")
+        }
+    }
+}
+
+/// Process a `diffs` command: list all tracked files with a summary.
+fn handle_diffs_cmd(diff_store: &Option<SharedDiffStore>) -> String {
+    let store = match diff_store {
+        Some(s) => s,
+        None => return "{\"error\":\"diff store not enabled (start with --diff)\"}\n".to_string(),
+    };
+
+    let guard = match store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            warn!("diff store lock poisoned");
+            return "{\"error\":\"internal error\"}\n".to_string();
+        }
+    };
+
+    let summary = guard.summary();
+    let keys: Vec<&str> = guard.list_keys();
+    let files: Vec<serde_json::Value> = keys
+        .iter()
+        .filter_map(|k| {
+            guard.get_latest(k).map(|entry| {
+                serde_json::json!({
+                    "path": k,
+                    "latest_diff_size": entry.diff.len(),
+                    "old_size": entry.old_size,
+                    "new_size": entry.new_size,
+                    "binary": entry.binary,
+                    "truncated": entry.truncated,
+                })
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "summary": summary,
+        "files": files,
+    });
+    format!("{body}\n")
+}
+
+/// Process a `diff-clear` command: clear all entries from the diff store.
+fn handle_diff_clear_cmd(diff_store: &Option<SharedDiffStore>) -> String {
+    let store = match diff_store {
+        Some(s) => s,
+        None => return "{\"error\":\"diff store not enabled (start with --diff)\"}\n".to_string(),
+    };
+
+    match store.lock() {
+        Ok(mut guard) => {
+            guard.clear();
+            "{\"status\":\"ok\"}\n".to_string()
+        }
+        Err(_) => {
+            warn!("diff store lock poisoned");
+            "{\"error\":\"internal error\"}\n".to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client helpers (used by `watchd reload` / `watchd status` / `watchd diff`)
+// ---------------------------------------------------------------------------
+
 /// Send a reload request to the control socket and print the response.
 pub async fn send_reload(control_addr: &str) -> std::result::Result<(), String> {
     send_control_command(control_addr, "reload").await
@@ -312,6 +427,31 @@ pub async fn send_reload(control_addr: &str) -> std::result::Result<(), String> 
 /// Send a status request to the control socket and print the response.
 pub async fn send_status(control_addr: &str) -> std::result::Result<(), String> {
     send_control_command(control_addr, "status").await
+}
+
+/// Send a diff request to the control socket and print the response.
+///
+/// When `path` is `Some`, queries the latest diff for that file.
+/// When `path` is `None`, lists all tracked files with a summary.
+pub async fn send_diff(control_addr: &str, path: Option<&str>) -> std::result::Result<(), String> {
+    let mut stream = tokio::net::TcpStream::connect(control_addr)
+        .await
+        .map_err(|e| format!("failed to connect to control socket at {control_addr}: {e}"))?;
+
+    let req = match path {
+        Some(p) => serde_json::json!({"cmd": "diff", "path": p}).to_string() + "\n",
+        None => serde_json::json!({"cmd": "diffs"}).to_string() + "\n",
+    };
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("failed to send diff request: {e}"))?;
+
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf).await;
+    println!("{}", String::from_utf8_lossy(&buf));
+
+    Ok(())
 }
 
 /// Generic helper: connect, send a JSON command, read the full response, print it.
@@ -340,6 +480,7 @@ async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv::DiffStore;
     use tokio::io::AsyncWriteExt;
 
     // =====================================================================
@@ -591,7 +732,131 @@ mod tests {
     // =====================================================================
 
     /// Helper: bind a control server on a random port and return the address.
+    // -- diff / diffs / diff-clear command handler tests --------------------
+
+    #[test]
+    fn handle_diff_cmd_store_disabled() {
+        let resp = handle_diff_cmd(&None, Some("x.txt"));
+        assert!(resp.contains("not enabled"));
+    }
+
+    #[test]
+    fn handle_diff_cmd_missing_path() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        let resp = handle_diff_cmd(&Some(store), None);
+        assert!(resp.contains("missing 'path'"));
+    }
+
+    #[test]
+    fn handle_diff_cmd_no_diff_found() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        let resp = handle_diff_cmd(&Some(store), Some("nope.txt"));
+        assert!(resp.contains("no diff found"));
+        assert!(resp.contains("nope.txt"));
+    }
+
+    #[test]
+    fn handle_diff_cmd_returns_latest_diff() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("a.css", b"old\n");
+            guard.record_change("a.css", b"new\n");
+        }
+        let resp = handle_diff_cmd(&Some(store), Some("a.css"));
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["path"], "a.css");
+        assert!(v["diff"].as_str().unwrap().contains("+ new\n"));
+        assert!(v["diff"].as_str().unwrap().contains("- old\n"));
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
+    fn handle_diff_cmd_truncated_file() {
+        let store = DiffStore::new_shared(5, 10, 8);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("big.txt", &vec![b'X'; 20]);
+        }
+        let resp = handle_diff_cmd(&Some(store), Some("big.txt"));
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert!(v["diff"].as_str().unwrap().contains("too large"));
+    }
+
+    #[test]
+    fn handle_diffs_cmd_store_disabled() {
+        let resp = handle_diffs_cmd(&None);
+        assert!(resp.contains("not enabled"));
+    }
+
+    #[test]
+    fn handle_diffs_cmd_empty_store() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        let resp = handle_diffs_cmd(&Some(store));
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["summary"]["tracked_files"], 0);
+        assert_eq!(v["summary"]["total_diffs"], 0);
+        assert!(v["files"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn handle_diffs_cmd_with_entries() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("a.txt", b"a\n");
+            guard.record_change("b.txt", b"b\n");
+        }
+        let resp = handle_diffs_cmd(&Some(store));
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["summary"]["tracked_files"], 2);
+        assert_eq!(v["summary"]["total_diffs"], 2);
+        assert_eq!(v["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn handle_diffs_cmd_summary_includes_max_file_size() {
+        let store = DiffStore::new_shared(5, 10, 4096);
+        let resp = handle_diffs_cmd(&Some(store));
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["summary"]["max_file_size"], 4096);
+    }
+
+    #[test]
+    fn handle_diff_clear_cmd_store_disabled() {
+        let resp = handle_diff_clear_cmd(&None);
+        assert!(resp.contains("not enabled"));
+    }
+
+    #[test]
+    fn handle_diff_clear_cmd_clears_store() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("a.txt", b"a");
+            guard.record_change("b.txt", b"b");
+        }
+        let resp = handle_diff_clear_cmd(&Some(store.clone()));
+        assert!(resp.contains("ok"));
+
+        let guard = store.lock().unwrap();
+        assert!(guard.list_keys().is_empty());
+    }
+
     async fn setup_control_server() -> (
+        String,
+        broadcast::Sender<String>,
+        StatusMap,
+        CancellationToken,
+        Arc<AtomicUsize>,
+    ) {
+        setup_control_server_with_diff(None).await
+    }
+
+    async fn setup_control_server_with_diff(
+        diff_store: Option<SharedDiffStore>,
+    ) -> (
         String,
         broadcast::Sender<String>,
         StatusMap,
@@ -611,6 +876,7 @@ mod tests {
             statuses.clone(),
             cancel.clone(),
             counter.clone(),
+            diff_store,
         );
 
         // Give the server a moment to start accepting.
@@ -743,6 +1009,67 @@ mod tests {
     // =====================================================================
 
     /// Helper: bind a WS server on a random port and return the address.
+    // -- control socket diff integration tests -----------------------------
+
+    #[tokio::test]
+    async fn control_socket_diff_command_store_disabled() {
+        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let resp = control_send(&addr, "{\"cmd\":\"diff\",\"path\":\"x.txt\"}\n").await;
+        assert!(resp.contains("not enabled"));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn control_socket_diff_command_returns_diff() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("f.css", b"old\n");
+            guard.record_change("f.css", b"new\n");
+        }
+        let (addr, _btx, _statuses, cancel, _counter) =
+            setup_control_server_with_diff(Some(store)).await;
+        let resp = control_send(&addr, "{\"cmd\":\"diff\",\"path\":\"f.css\"}\n").await;
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["path"], "f.css");
+        assert!(v["diff"].as_str().unwrap().contains("- old\n"));
+        assert!(v["diff"].as_str().unwrap().contains("+ new\n"));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn control_socket_diffs_command_returns_summary() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("a.txt", b"a\n");
+        }
+        let (addr, _btx, _statuses, cancel, _counter) =
+            setup_control_server_with_diff(Some(store)).await;
+        let resp = control_send(&addr, "{\"cmd\":\"diffs\"}\n").await;
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["summary"]["tracked_files"], 1);
+        assert_eq!(v["files"].as_array().unwrap().len(), 1);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn control_socket_diff_clear_command() {
+        let store = DiffStore::new_shared(5, 10, 1024);
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record_change("a.txt", b"a");
+        }
+        let (addr, _btx, _statuses, cancel, _counter) =
+            setup_control_server_with_diff(Some(store.clone())).await;
+        let resp = control_send(&addr, "{\"cmd\":\"diff-clear\"}\n").await;
+        assert!(resp.contains("ok"));
+
+        let guard = store.lock().unwrap();
+        assert!(guard.list_keys().is_empty());
+        cancel.cancel();
+    }
+
     async fn setup_ws_server() -> (
         String,
         broadcast::Sender<String>,
@@ -1028,6 +1355,7 @@ mod tests {
             statuses.clone(),
             cancel.clone(),
             counter.clone(),
+            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

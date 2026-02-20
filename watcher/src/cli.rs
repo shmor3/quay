@@ -45,7 +45,20 @@ pub struct Args {
     #[arg(long = "cmd-timeout-ms")]
     pub cmd_timeout_ms: Option<u64>,
 
-    /// Optional subcommand: `reload` or `status` (if omitted, run the watcher server).
+    /// Enable the in-memory diff store.  When set, watchd records a unified
+    /// diff (using `+` / `-` prefixes) for every file change and exposes it
+    /// via the control socket (`diff`, `diffs`, `diff-clear` commands).
+    #[arg(long = "diff")]
+    pub diff: bool,
+
+    /// Maximum file size (in bytes) the diff store will process.  Files larger
+    /// than this are recorded with a placeholder instead of a real diff, and
+    /// their content is not kept in memory.  Ignored unless `--diff` is set.
+    /// Defaults to 524288 (512 KiB).
+    #[arg(long = "diff-max-file-size", default_value_t = 512 * 1024)]
+    pub diff_max_file_size: usize,
+
+    /// Optional subcommand: `reload`, `status`, or `diff` (if omitted, run the watcher server).
     #[command(subcommand)]
     pub subcmd: Option<SubCommand>,
 }
@@ -57,6 +70,14 @@ pub enum SubCommand {
     Reload,
     /// Query status of loaded configs from the running watchd instance.
     Status,
+    /// Query stored file diffs from the running watchd instance.
+    /// Shows the latest diff for a specific file, or lists all tracked files.
+    Diff {
+        /// File path to show the diff for.  When omitted, lists all tracked
+        /// files with a summary.
+        #[arg(long = "path")]
+        path: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +115,8 @@ mod tests {
         assert_eq!(args.bind_addr, "127.0.0.1");
         assert!(!args.print_snippet);
         assert!(args.cmd_timeout_ms.is_none());
+        assert!(!args.diff);
+        assert_eq!(args.diff_max_file_size, 512 * 1024);
         assert!(args.subcmd.is_none());
     }
 
@@ -171,6 +194,33 @@ mod tests {
         assert_eq!(args.cmd_timeout_ms, Some(0));
     }
 
+    // -- Diff flags --------------------------------------------------------
+
+    #[test]
+    fn diff_flag_off_by_default() {
+        let args = parse(&[]);
+        assert!(!args.diff);
+    }
+
+    #[test]
+    fn diff_flag_enabled() {
+        let args = parse(&["--diff"]);
+        assert!(args.diff);
+    }
+
+    #[test]
+    fn diff_max_file_size_default() {
+        let args = parse(&[]);
+        assert_eq!(args.diff_max_file_size, 512 * 1024);
+    }
+
+    #[test]
+    fn diff_max_file_size_custom() {
+        let args = parse(&["--diff", "--diff-max-file-size", "1048576"]);
+        assert!(args.diff);
+        assert_eq!(args.diff_max_file_size, 1048576);
+    }
+
     // -- Subcommands -------------------------------------------------------
 
     #[test]
@@ -186,10 +236,34 @@ mod tests {
     }
 
     #[test]
+    fn diff_subcommand_no_path() {
+        let args = parse(&["diff"]);
+        assert!(matches!(args.subcmd, Some(SubCommand::Diff { path: None })));
+    }
+
+    #[test]
+    fn diff_subcommand_with_path() {
+        let args = parse(&["diff", "--path", "src/main.css"]);
+        match &args.subcmd {
+            Some(SubCommand::Diff { path }) => {
+                assert_eq!(path.as_deref(), Some("src/main.css"));
+            }
+            other => panic!("expected Diff subcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn subcommand_with_port() {
         let args = parse(&["--port", "4000", "reload"]);
         assert_eq!(args.port, 4000);
         assert!(matches!(args.subcmd, Some(SubCommand::Reload)));
+    }
+
+    #[test]
+    fn diff_subcommand_with_port() {
+        let args = parse(&["--port", "4000", "diff", "--path", "x.css"]);
+        assert_eq!(args.port, 4000);
+        assert!(matches!(args.subcmd, Some(SubCommand::Diff { .. })));
     }
 
     #[test]
@@ -215,6 +289,9 @@ mod tests {
             "--no-run-on-start",
             "--cmd-timeout-ms",
             "15000",
+            "--diff",
+            "--diff-max-file-size",
+            "262144",
             "make build",
         ]);
         assert_eq!(args.port, 5000);
@@ -223,6 +300,8 @@ mod tests {
         assert_eq!(args.path, PathBuf::from("/srv/app"));
         assert!(args.no_run_on_start);
         assert_eq!(args.cmd_timeout_ms, Some(15000));
+        assert!(args.diff);
+        assert_eq!(args.diff_max_file_size, 262144);
         assert_eq!(args.cmd_template, "make build");
         assert!(args.subcmd.is_none());
     }
@@ -301,5 +380,18 @@ mod tests {
 
         let cloned = sub.clone();
         assert!(format!("{:?}", cloned).contains("Status"));
+    }
+
+    #[test]
+    fn subcommand_diff_debug_and_clone() {
+        let sub = SubCommand::Diff {
+            path: Some("test.css".to_string()),
+        };
+        let dbg = format!("{:?}", sub);
+        assert!(dbg.contains("Diff"));
+        assert!(dbg.contains("test.css"));
+
+        let cloned = sub.clone();
+        assert!(format!("{:?}", cloned).contains("Diff"));
     }
 }

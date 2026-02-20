@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{self, ConfigEntry, NotifyMode};
 use crate::filter::{normalize_path, PathFilter};
+use crate::kv::SharedDiffStore;
 use crate::server::{set_status, StatusMap};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,10 @@ pub struct WatcherParams {
     pub cmd_timeout_ms: Option<u64>,
     /// Shared counter of active WebSocket connections (for status reporting).
     pub connection_count: Arc<AtomicUsize>,
+    /// Optional diff store.  When `Some`, file diffs are recorded on every
+    /// change so they can be queried via the control socket.
+    /// Enabled by the `--diff` CLI flag.
+    pub diff_store: Option<SharedDiffStore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +432,8 @@ struct WorkerContext {
     cmd_timeout: Option<Duration>,
     /// Absolute path to `hotreload.yaml` (used for config hot-reload detection).
     config_path: Box<Path>,
+    /// Optional diff store for recording file change diffs.
+    diff_store: Option<SharedDiffStore>,
 }
 
 impl WorkerContext {
@@ -512,6 +519,13 @@ impl WorkerContext {
         }
 
         let normalized = normalize_path(&raw);
+
+        // Record the diff in the KV store (if enabled).
+        if let Some(ref store) = self.diff_store {
+            if let Ok(mut guard) = store.lock() {
+                guard.record_change_from_disk(&normalized, path);
+            }
+        }
 
         // Detect config file change → hot-reload.
         if path == self.config_path.as_ref() {
@@ -615,6 +629,7 @@ pub fn start(params: WatcherParams) -> crate::error::Result<RecommendedWatcher> 
         cancel: _cancel,
         cmd_timeout_ms,
         connection_count: _connection_count,
+        diff_store,
     } = params;
 
     let cmd_timeout = cmd_timeout_ms.map(Duration::from_millis);
@@ -660,6 +675,7 @@ pub fn start(params: WatcherParams) -> crate::error::Result<RecommendedWatcher> 
         debouncer: Debouncer::new(Duration::from_millis(debounce_ms)),
         cmd_timeout,
         config_path,
+        diff_store,
     };
     std::thread::Builder::new()
         .name("watchd-worker".to_string())
@@ -1657,6 +1673,7 @@ mod tests {
             debouncer: Debouncer::new(Duration::from_millis(200)),
             cmd_timeout: None,
             config_path: cfg_path,
+            diff_store: None,
         };
 
         let handle = std::thread::spawn(move || ctx.run());
@@ -1690,6 +1707,7 @@ mod tests {
             debouncer: Debouncer::new(Duration::from_millis(200)),
             cmd_timeout: None,
             config_path: cfg_path,
+            diff_store: None,
         };
 
         let handle = std::thread::spawn(move || ctx.run());
@@ -1730,6 +1748,7 @@ mod tests {
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
             config_path: cfg_path,
+            diff_store: None,
         };
 
         let handle = std::thread::spawn(move || ctx.run());
@@ -1779,6 +1798,7 @@ mod tests {
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
+            diff_store: None,
         };
 
         let handle = std::thread::spawn(move || ctx.run());
@@ -1842,6 +1862,7 @@ mod tests {
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
             config_path: cfg_path,
+            diff_store: None,
         };
 
         let handle = std::thread::spawn(move || ctx.run());
@@ -1890,6 +1911,7 @@ mod tests {
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
+            diff_store: None,
         };
 
         let handle = std::thread::spawn(move || ctx.run());
