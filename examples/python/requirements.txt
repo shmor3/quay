@@ -1,0 +1,7 @@
+# watchd hot-reload client for Python
+#
+# Async client (recommended):
+websockets>=12.0
+
+# Synchronous alternative (use with --sync flag):
+# websocket-client>=1.7.0

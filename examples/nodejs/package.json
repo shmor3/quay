@@ -1,0 +1,20 @@
+{
+  "name": "hotreload-client-nodejs",
+  "version": "1.0.0",
+  "description": "watchd hot-reload client for Node.js — connects to a watchd WebSocket server and reacts to file-change notifications.",
+  "main": "hotreload-client.js",
+  "scripts": {
+    "start": "node hotreload-client.js"
+  },
+  "keywords": [
+    "hotreload",
+    "watchd",
+    "websocket",
+    "livereload",
+    "file-watcher"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

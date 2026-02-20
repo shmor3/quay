@@ -81,9 +81,26 @@ cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project --port 3
 ./watcher/target/debug/watchd --port 3012 reload
 ```
 
-## Browser client
+## Client Libraries
 
-Add the hot-reload client to your HTML pages to receive live updates. Use `--print-snippet` to generate the appropriate `<script>` tag, or include the standalone file:
+The `watchd` server is **language-agnostic** — any WebSocket client that understands the simple JSON protocol can integrate with it. Example clients are provided in the [`examples/`](examples/) directory for multiple languages and platforms:
+
+| Directory                              | Language / Platform        | Description                                        |
+|----------------------------------------|----------------------------|----------------------------------------------------|
+| [`examples/javascript/`](examples/javascript/) | JavaScript (Browser) | Drop-in browser `<script>` with auto-reconnect     |
+| [`examples/html/`](examples/html/)     | HTML                       | Minimal demo page using the browser client         |
+| [`examples/nodejs/`](examples/nodejs/) | Node.js                    | Server-side client using the `ws` package          |
+| [`examples/python/`](examples/python/) | Python 3                   | Async client using `websockets`                    |
+| [`examples/go/`](examples/go/)         | Go                         | Client using `gorilla/websocket`                   |
+| [`examples/rust/`](examples/rust/)     | Rust                       | Client using `tungstenite`                         |
+| [`examples/ruby/`](examples/ruby/)     | Ruby                       | Client using `websocket-client-simple`             |
+| [`examples/csharp/`](examples/csharp/) | C# / .NET                  | Client using `System.Net.WebSockets`               |
+
+See [`examples/README.md`](examples/README.md) for the full WebSocket protocol specification and quick-start instructions for each client.
+
+### Browser client
+
+Add the hot-reload client to your HTML pages to receive live updates. Use `--print-snippet` to generate the appropriate `<script>` tag, or include the standalone file from `examples/javascript/`:
 
 ```html
 <script src="/hotreload-client.js"></script>
@@ -95,13 +112,26 @@ Override the default port with a `data-port` attribute:
 <script src="/hotreload-client.js" data-port="4000"></script>
 ```
 
-The client will:
+The browser client will:
 
 - **Auto-reconnect** with exponential backoff (1 s → 30 s cap)
 - **Reload the page** on `reload` messages
 - **Inject CSS** on `inject-css` messages without a full page reload
 - **Cache-bust** linked stylesheets whose `href` matches the changed path
 - **Log** connection lifecycle events to the browser console
+
+### Writing your own client
+
+Implementing a watchd client in any language is straightforward:
+
+1. Open a WebSocket connection to `ws://localhost:3012`.
+2. Listen for incoming text messages.
+3. Parse each message as JSON.
+4. Inspect the `type` field:
+   - `"reload"` → perform your reload action.
+   - `"inject-css"` → base64-decode the `content` field and apply the CSS.
+   - Unknown types → log and ignore (forward compatibility).
+5. On disconnect, reconnect with exponential backoff.
 
 ## Logging
 
@@ -132,6 +162,9 @@ The codebase is organised into focused modules:
 | `server.rs`  | WebSocket server, control socket, and client helpers        |
 | `watcher.rs` | File-system watcher, debouncing, command execution          |
 | `main.rs`    | Entry point and orchestration                               |
+
+The `examples/` directory contains ready-to-use client implementations for
+JavaScript, Node.js, Python, Go, Rust, Ruby, and C#/.NET.
 
 See `watcher/README.md` for detailed configuration, notification modes, and extensibility documentation.
 

@@ -1,0 +1,80 @@
+/* watchd demo — companion stylesheet
+ *
+ * Edit this file while watchd is running to see CSS hot-injection in action.
+ * The browser client will apply changes without a full page reload.
+ *
+ * Try changing colours, font sizes, or adding new rules!
+ */
+
+/* ── Accent colour override ─────────────────────────────────────────────── */
+
+h1 {
+  text-shadow: 0 0 24px rgba(245, 194, 231, 0.25);
+}
+
+/* ── Status card glow effect ────────────────────────────────────────────── */
+
+.status-card {
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+.status-card:hover {
+  border-color: #585b70;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+
+/* ── Log panel scrollbar styling ────────────────────────────────────────── */
+
+.log-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.log-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.log-panel::-webkit-scrollbar-thumb {
+  background: #45475a;
+  border-radius: 3px;
+}
+
+.log-panel::-webkit-scrollbar-thumb:hover {
+  background: #585b70;
+}
+
+/* ── Animations ─────────────────────────────────────────────────────────── */
+
+.log-entry {
+  animation: fadeIn 0.2s ease-in;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Responsive tweaks ──────────────────────────────────────────────────── */
+
+@media (max-width: 480px) {
+  body {
+    padding: 1rem;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+  }
+
+  .stats {
+    gap: 1rem;
+  }
+
+  .stat-value {
+    font-size: 1.25rem;
+  }
+}

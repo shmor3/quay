@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>watchd Hot-Reload Demo</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue",
+        sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    .container {
+      max-width: 640px;
+      width: 100%;
+    }
+
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 0.5rem;
+      color: #f5c2e7;
+    }
+
+    .subtitle {
+      color: #a6adc8;
+      margin-bottom: 2rem;
+    }
+
+    .status-card {
+      background: #313244;
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      border: 1px solid #45475a;
+    }
+
+    .status-card h2 {
+      font-size: 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #a6adc8;
+      margin-bottom: 1rem;
+    }
+
+    .indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 1.1rem;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #f38ba8;
+      transition: background 0.3s ease;
+    }
+
+    .dot.connected {
+      background: #a6e3a1;
+      box-shadow: 0 0 8px rgba(166, 227, 161, 0.5);
+    }
+
+    .dot.connecting {
+      background: #f9e2af;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .log-panel {
+      background: #181825;
+      border-radius: 12px;
+      padding: 1.5rem;
+      border: 1px solid #45475a;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+
+    .log-panel h2 {
+      font-size: 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #a6adc8;
+      margin-bottom: 1rem;
+    }
+
+    .log-entry {
+      font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", monospace;
+      font-size: 0.85rem;
+      padding: 0.35rem 0;
+      border-bottom: 1px solid #313244;
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .log-entry:last-child {
+      border-bottom: none;
+    }
+
+    .log-time {
+      color: #585b70;
+      white-space: nowrap;
+    }
+
+    .log-msg {
+      color: #cdd6f4;
+    }
+
+    .log-msg.info { color: #89b4fa; }
+    .log-msg.warn { color: #f9e2af; }
+    .log-msg.reload { color: #a6e3a1; }
+    .log-msg.css { color: #f5c2e7; }
+
+    .instructions {
+      margin-top: 2rem;
+      color: #585b70;
+      font-size: 0.85rem;
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    .instructions code {
+      background: #313244;
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-family: "Fira Code", monospace;
+      color: #a6adc8;
+    }
+
+    .reload-count {
+      font-size: 2rem;
+      font-weight: bold;
+      color: #89b4fa;
+    }
+
+    .stats {
+      display: flex;
+      gap: 2rem;
+      margin-top: 0.5rem;
+    }
+
+    .stat-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .stat-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #585b70;
+    }
+
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: bold;
+    }
+
+    .stat-value.reloads { color: #89b4fa; }
+    .stat-value.css-injects { color: #f5c2e7; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚡ watchd Demo</h1>
+    <p class="subtitle">Hot-reload client running in the browser</p>
+
+    <div class="status-card">
+      <h2>Connection</h2>
+      <div class="indicator">
+        <div class="dot" id="status-dot"></div>
+        <span id="status-text">Disconnected</span>
+      </div>
+      <div class="stats">
+        <div class="stat-item">
+          <span class="stat-value reloads" id="reload-count">0</span>
+          <span class="stat-label">Reloads</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value css-injects" id="css-count">0</span>
+          <span class="stat-label">CSS Injects</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="log-panel" id="log-panel">
+      <h2>Event Log</h2>
+      <div id="log-entries"></div>
+    </div>
+
+    <p class="instructions">
+      Start the watcher with <code>watchd --path .</code> and edit files in the
+      watched directory to see live events here.<br>
+      Modify <code>styles.css</code> to see CSS hot-injection in action.
+    </p>
+  </div>
+
+  <!--
+    watchd hot-reload client.
+
+    This demo intercepts messages before they trigger a full page reload so you
+    can see the events in the log panel.  In production, simply include the
+    script without overrides and reloads happen automatically.
+
+    Override the default port with data-port if needed:
+      <script src="/hotreload-client.js" data-port="4000"></script>
+  -->
+  <script>
+    (function () {
+      "use strict";
+
+      var DEFAULT_PORT = 3012;
+
+      // Read optional port override from a data attribute on this script tag.
+      var scriptEl = document.currentScript;
+      var port =
+        scriptEl && scriptEl.getAttribute("data-port")
+          ? parseInt(scriptEl.getAttribute("data-port"), 10)
+          : DEFAULT_PORT;
+
+      if (isNaN(port) || port < 1 || port > 65535) {
+        port = DEFAULT_PORT;
+      }
+
+      // DOM references
+      var dot = document.getElementById("status-dot");
+      var statusText = document.getElementById("status-text");
+      var reloadCountEl = document.getElementById("reload-count");
+      var cssCountEl = document.getElementById("css-count");
+      var logEntries = document.getElementById("log-entries");
+      var logPanel = document.getElementById("log-panel");
+
+      var reloadCount = 0;
+      var cssCount = 0;
+
+      // Reconnection state
+      var INITIAL_DELAY = 1000;
+      var MAX_DELAY = 30000;
+      var reconnectDelay = INITIAL_DELAY;
+      var reconnectTimer = null;
+
+      function timestamp() {
+        var d = new Date();
+        return (
+          String(d.getHours()).padStart(2, "0") +
+          ":" +
+          String(d.getMinutes()).padStart(2, "0") +
+          ":" +
+          String(d.getSeconds()).padStart(2, "0")
+        );
+      }
+
+      function appendLog(msg, cls) {
+        var entry = document.createElement("div");
+        entry.className = "log-entry";
+
+        var time = document.createElement("span");
+        time.className = "log-time";
+        time.textContent = timestamp();
+
+        var text = document.createElement("span");
+        text.className = "log-msg " + (cls || "");
+        text.textContent = msg;
+
+        entry.appendChild(time);
+        entry.appendChild(text);
+        logEntries.appendChild(entry);
+
+        // Auto-scroll to bottom
+        logPanel.scrollTop = logPanel.scrollHeight;
+      }
+
+      function setStatus(state, text) {
+        dot.className = "dot " + state;
+        statusText.textContent = text;
+      }
+
+      function b64decode(str) {
+        try {
+          return atob(str);
+        } catch (e) {
+          return "";
+        }
+      }
+
+      function injectCSS(path, encodedContent) {
+        var css = b64decode(encodedContent);
+        if (!css) return;
+
+        var escapedPath =
+          typeof CSS !== "undefined" && typeof CSS.escape === "function"
+            ? CSS.escape(path)
+            : path.replace(/"/g, '\\"');
+
+        var existing = document.querySelector(
+          'style[data-hotreload="' + escapedPath + '"]'
+        );
+
+        if (existing) {
+          existing.textContent = css;
+        } else {
+          var style = document.createElement("style");
+          style.setAttribute("data-hotreload", path);
+          style.textContent = css;
+          document.head.appendChild(style);
+        }
+
+        // Cache-bust linked stylesheets
+        var links = document.querySelectorAll('link[rel="stylesheet"]');
+        for (var i = 0; i < links.length; i++) {
+          var href = links[i].getAttribute("href");
+          if (href && href.indexOf(path) !== -1) {
+            var base = href.split("?")[0];
+            links[i].setAttribute("href", base + "?_hr=" + Date.now());
+          }
+        }
+      }
+
+      function connect() {
+        var host = location.hostname || "localhost";
+        var url = "ws://" + host + ":" + port;
+
+        setStatus("connecting", "Connecting to " + url + "…");
+        appendLog("Connecting to " + url, "info");
+
+        var ws;
+        try {
+          ws = new WebSocket(url);
+        } catch (e) {
+          appendLog("WebSocket constructor failed: " + e, "warn");
+          setStatus("", "Connection failed");
+          scheduleReconnect();
+          return;
+        }
+
+        ws.onopen = function () {
+          setStatus("connected", "Connected to " + url);
+          appendLog("Connected", "info");
+          reconnectDelay = INITIAL_DELAY;
+        };
+
+        ws.onmessage = function (event) {
+          var msg;
+          try {
+            msg = JSON.parse(event.data);
+          } catch (e) {
+            appendLog("Failed to parse: " + event.data, "warn");
+            return;
+          }
+
+          switch (msg.type) {
+            case "reload":
+              reloadCount++;
+              reloadCountEl.textContent = reloadCount;
+              appendLog("Reload requested — intercepted for demo (would normally reload the page)", "reload");
+              break;
+
+            case "inject-css":
+              if (msg.path && msg.content) {
+                cssCount++;
+                cssCountEl.textContent = cssCount;
+                injectCSS(msg.path, msg.content);
+                appendLog("CSS injected: " + msg.path, "css");
+              } else {
+                appendLog("inject-css message missing path or content", "warn");
+              }
+              break;
+
+            default:
+              appendLog("Unknown message type: " + msg.type, "warn");
+          }
+        };
+
+        ws.onclose = function (event) {
+          setStatus("", "Disconnected (code " + event.code + ")");
+          appendLog("Disconnected (code " + event.code + ")", "warn");
+          scheduleReconnect();
+        };
+
+        ws.onerror = function () {
+          // onclose fires after onerror — reconnection handled there
+        };
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimer) return;
+        var delaySec = (reconnectDelay / 1000).toFixed(1);
+        appendLog("Reconnecting in " + delaySec + "s", "info");
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
+          connect();
+        }, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, MAX_DELAY);
+      }
+
+      // Bootstrap
+      appendLog("watchd demo client initialised", "info");
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", connect);
+      } else {
+        connect();
+      }
+    })();
+  </script>
+</body>
+</html>
