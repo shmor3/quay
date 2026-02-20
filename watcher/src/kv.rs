@@ -36,6 +36,7 @@ use tracing::{debug, warn};
 /// Default maximum file size (in bytes) that the diff store will process.
 /// Files larger than this are skipped with a placeholder message.
 /// 512 KiB — generous for source files, safe for memory.
+#[allow(dead_code)]
 pub const DEFAULT_MAX_FILE_SIZE: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,7 @@ impl std::fmt::Debug for DiffStore {
     }
 }
 
+#[allow(dead_code)]
 impl DiffStore {
     // -- Construction ------------------------------------------------------
 

@@ -51,6 +51,8 @@ The `watchd` program supports flags and subcommands. Run the watcher server (def
 | `--no-run-on-start`       |                      | Do not run configured commands on startup                         |
 | `--cmd-timeout-ms <MS>`   |                      | Maximum time to wait for a command before killing it              |
 | `--print-snippet`         |                      | Print the HTML `<script>` snippet for embedding the client, then exit |
+| `--diff`                  |                      | Enable the in-memory diff store for file change tracking          |
+| `--diff-max-file-size <B>`| `524288`             | Maximum file size (bytes) the diff store will process (ignored without `--diff`) |
 
 ### Client-mode subcommands
 
@@ -58,6 +60,8 @@ These contact the running `watchd` instance via the control socket (port + 1):
 
 - `status` — query the running watchd for status of loaded configs and active connections
 - `reload` — request an immediate reload; broadcasts a `reload` message to all connected clients
+- `diff --path <FILE>` — show the latest diff for a specific file (requires `--diff` on the server)
+- `diff` — list all tracked files with a summary (requires `--diff` on the server)
 
 ## Examples
 
@@ -71,6 +75,9 @@ cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project --port 3
 # use a command timeout to kill stuck builds after 30 seconds
 ./watcher/target/debug/watchd --path . --cmd-timeout-ms 30000
 
+# enable the diff store to track file changes
+./watcher/target/debug/watchd --path . --diff
+
 # print the browser client snippet for embedding
 ./watcher/target/debug/watchd --print-snippet
 
@@ -79,6 +86,12 @@ cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project --port 3
 
 # trigger reload (client-mode subcommand)
 ./watcher/target/debug/watchd --port 3012 reload
+
+# query the latest diff for a file (client-mode subcommand)
+./watcher/target/debug/watchd --port 3012 diff --path src/styles/main.css
+
+# list all tracked file diffs (client-mode subcommand)
+./watcher/target/debug/watchd --port 3012 diff
 ```
 
 ## Client Libraries
@@ -159,6 +172,7 @@ The codebase is organised into focused modules:
 | `config.rs`  | YAML config parsing with serde deserialization              |
 | `error.rs`   | Centralised error type (`WatchdError`)                      |
 | `filter.rs`  | Glob-based include/exclude path filtering                   |
+| `kv.rs`      | Bounded in-memory diff store for file change tracking       |
 | `server.rs`  | WebSocket server, control socket, and client helpers        |
 | `watcher.rs` | File-system watcher, debouncing, command execution          |
 | `main.rs`    | Entry point and orchestration                               |

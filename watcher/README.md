@@ -30,6 +30,7 @@ The codebase is split into focused modules:
 | `config.rs`  | YAML config parsing with serde deserialization              |
 | `error.rs`   | Centralised error type (`WatchdError`)                      |
 | `filter.rs`  | Glob-based include/exclude path filtering                   |
+| `kv.rs`      | Bounded in-memory diff store for file change tracking       |
 | `server.rs`  | WebSocket server, control socket, and client helpers        |
 | `watcher.rs` | File-system watcher, debouncing, command execution          |
 | `main.rs`    | Entry point and orchestration                               |
@@ -70,6 +71,8 @@ watchd [OPTIONS] [CMD_TEMPLATE]
 | `--no-run-on-start`       |                      | Do not run configured commands on startup                         |
 | `--cmd-timeout-ms <MS>`   |                      | Maximum time to wait for a command before killing it              |
 | `--print-snippet`         |                      | Print the HTML `<script>` snippet for embedding the client, then exit |
+| `--diff`                  |                      | Enable the in-memory diff store for file change tracking          |
+| `--diff-max-file-size <B>`| `524288`             | Maximum file size (bytes) the diff store will process (ignored without `--diff`) |
 
 ### Client-mode subcommands
 
@@ -81,6 +84,12 @@ watchd --port 3012 status
 
 # Trigger an immediate reload
 watchd --port 3012 reload
+
+# Show the latest diff for a specific file (requires --diff on the server)
+watchd --port 3012 diff --path src/styles/main.css
+
+# List all tracked files with a summary (requires --diff on the server)
+watchd --port 3012 diff
 ```
 
 ## Browser client
@@ -121,6 +130,52 @@ If the watchd server runs on a non-default port, use the `data-port` attribute:
 - **Cache-busting** of `<link rel="stylesheet">` elements whose `href` matches the changed path
 - **Console logging** with coloured `[hotreload]` prefix
 - Zero external dependencies — pure vanilla JS
+
+## Diff store
+
+When started with `--diff`, watchd records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
+
+### Enabling
+
+```bash
+watchd --path . --diff
+```
+
+Optionally adjust the maximum file size (files larger than this are recorded with a placeholder instead of a real diff):
+
+```bash
+watchd --path . --diff --diff-max-file-size 1048576
+```
+
+### Querying diffs
+
+```bash
+# Latest diff for a specific file
+watchd --port 3012 diff --path src/main.css
+
+# Summary of all tracked files
+watchd --port 3012 diff
+```
+
+### Control socket commands
+
+When the diff store is enabled, three additional JSON commands are available on the control socket (port + 1):
+
+| Command                              | Description                                    |
+|--------------------------------------|------------------------------------------------|
+| `{"cmd":"diff","path":"<path>"}`     | Return the latest diff for the given file      |
+| `{"cmd":"diffs"}`                    | List all tracked files with summary statistics  |
+| `{"cmd":"diff-clear"}`              | Clear all entries from the diff store           |
+
+### Limits
+
+The diff store is bounded to prevent unbounded memory growth:
+
+- **Per-key capacity**: 50 diff entries per file (oldest evicted first)
+- **Max tracked files**: 500 distinct paths (least-recently-inserted evicted)
+- **Max file size**: 512 KiB by default (configurable with `--diff-max-file-size`)
+
+Files exceeding the size limit are recorded with a `<file too large>` placeholder and their content is not stored in memory.
 
 ## Configuration
 

@@ -61,7 +61,6 @@ pub const CLIENT_JS: &str = r#"(function(){
 
   function injectCSS(path, encodedContent) {
     var css = b64decode(encodedContent);
-    var id = "hotreload:" + path;
     var existing = document.querySelector('style[data-hotreload="' + CSS.escape(path) + '"]');
     if (existing) {
       existing.textContent = css;
