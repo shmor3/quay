@@ -1936,4 +1936,1823 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ======================================================================
+    // Edge-case and chaos tests
+    // ======================================================================
+
+    // -- WorkerContext with diff store enabled ------------------------------
+
+    #[test]
+    fn worker_context_with_diff_store_records_changes() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_diffstore");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Create a real file that will be "changed".
+        let file_path = dir.join("tracked.html");
+        std::fs::write(&file_path, "<html><body>v1</body></html>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: Some(diff_store.clone()),
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![file_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The diff store should have recorded the change.
+        let guard = diff_store.lock().unwrap();
+        let keys = guard.list_keys();
+        assert!(!keys.is_empty(), "diff store should have at least one key");
+
+        // Verify a broadcast was sent (HTML file → reload).
+        let msg = brx.try_recv().expect("should receive a broadcast");
+        assert!(msg.contains("reload"));
+
+        drop(guard);
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Config hot-reload detection ---------------------------------------
+
+    #[test]
+    fn worker_context_detects_config_change() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(vec!["original".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_hotreload_cfg");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let cfg_path = dir.join("hotreload.yaml");
+        // Write a valid config for hot-reload.
+        std::fs::write(
+            &cfg_path,
+            "- name: reloaded\n  watch: \"**/*.rs\"\n  notify: reload\n",
+        )
+        .unwrap();
+
+        // Canonicalize so it matches what the watcher does.
+        let canonical = cfg_path.canonicalize().unwrap().into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses: statuses.clone(),
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: canonical.clone(),
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send an event for the config file path itself.
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![canonical.to_path_buf()],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Status map should now contain "reloaded" instead of "original".
+        {
+            let guard = statuses.lock().unwrap();
+            assert!(
+                guard.contains_key("reloaded"),
+                "status map should contain the reloaded config name, got: {:?}",
+                *guard
+            );
+            assert!(
+                !guard.contains_key("original"),
+                "old config should have been cleared"
+            );
+        }
+
+        // No broadcast should be sent for config file changes.
+        assert!(brx.try_recv().is_err());
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Event with multiple paths -----------------------------------------
+
+    #[test]
+    fn worker_context_handles_multi_path_event() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_multipath");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let html1 = dir.join("a.html");
+        let html2 = dir.join("b.html");
+        std::fs::write(&html1, "<a>").unwrap();
+        std::fs::write(&html2, "<b>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo multi".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Single event with two paths.
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![html1, html2],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Should receive two broadcast messages (one per path).
+        let msg1 = brx.try_recv().expect("first path broadcast");
+        assert!(msg1.contains("reload"));
+        let msg2 = brx.try_recv().expect("second path broadcast");
+        assert!(msg2.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Event with empty paths vec ----------------------------------------
+
+    #[test]
+    fn worker_context_handles_empty_paths_event() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_emptypaths");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Event with no paths at all — should be handled gracefully.
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // No broadcast expected.
+        assert!(brx.try_recv().is_err());
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Generic fallback path (non-HTML, non-CSS, no config) --------------
+
+    #[test]
+    fn worker_context_generic_fallback_runs_command_and_reloads() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_generic_fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Create a file with an extension that doesn't match HTML or CSS.
+        let rs_path = dir.join("lib.rs");
+        std::fs::write(&rs_path, "fn main() {}").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![], // No configs → falls through to generic fallback.
+            statuses,
+            cmd_template: "echo fallback {path}".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: Some(Duration::from_secs(5)),
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![rs_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The generic fallback should broadcast a reload.
+        let msg = brx.try_recv().expect("should receive reload broadcast");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- CSS fallback (no config match, .css extension) --------------------
+
+    #[test]
+    fn worker_context_css_fallback_injects_css() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_css_fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let css_path = dir.join("theme.css");
+        std::fs::write(&css_path, "h1 { color: green; }").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![], // No configs → CSS fallback.
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![css_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let msg = brx.try_recv().expect("should receive inject-css broadcast");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- HTM extension fallback --------------------------------------------
+
+    #[test]
+    fn worker_context_htm_extension_triggers_reload() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_htm");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let htm_path = dir.join("index.htm");
+        std::fs::write(&htm_path, "<html></html>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![htm_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let msg = brx
+            .try_recv()
+            .expect("should receive reload broadcast for .htm");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Rapid-fire chaos: many events in quick succession -----------------
+
+    #[test]
+    fn worker_context_rapid_fire_events_no_panic() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _brx) = broadcast::channel::<String>(256);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_rapidfire");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Create many files.
+        for i in 0..20 {
+            let path = dir.join(format!("file_{}.html", i));
+            std::fs::write(&path, format!("<p>{}</p>", i)).unwrap();
+        }
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo rapid".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(5)),
+            cmd_timeout: Some(Duration::from_secs(2)),
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Blast 200 events rapidly.
+        for i in 0..200 {
+            let file_idx = i % 20;
+            let event = Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                paths: vec![dir.join(format!("file_{}.html", file_idx))],
+                attrs: Default::default(),
+            };
+            tx.send(Ok(event)).unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        drop(tx);
+        handle
+            .join()
+            .expect("worker should survive rapid-fire events");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Mixed event types chaos -------------------------------------------
+
+    #[test]
+    fn worker_context_mixed_event_types_no_panic() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _brx) = broadcast::channel::<String>(64);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_mixedchaos");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo chaos".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(1)),
+            cmd_timeout: Some(Duration::from_secs(1)),
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let kinds = vec![
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Create(notify::event::CreateKind::Folder),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            EventKind::Access(notify::event::AccessKind::Read),
+            EventKind::Modify(notify::event::ModifyKind::Metadata(
+                notify::event::MetadataKind::WriteTime,
+            )),
+            EventKind::Other,
+            EventKind::Any,
+        ];
+
+        let paths = vec![
+            dir.join("a.css"),
+            dir.join("b.html"),
+            dir.join("c.js"),
+            dir.join("d.rs"),
+            dir.join("Makefile"),
+        ];
+
+        // Create the files so CSS inject can read them.
+        for p in &paths {
+            std::fs::write(p, "content").unwrap();
+        }
+
+        // Send a mix of all event kinds with all path types.
+        for kind in &kinds {
+            for path in &paths {
+                let event = Event {
+                    kind: kind.clone(),
+                    paths: vec![path.clone()],
+                    attrs: Default::default(),
+                };
+                let _ = tx.send(Ok(event));
+            }
+        }
+
+        // Also throw in some errors.
+        for _ in 0..5 {
+            let _ = tx.send(Err(notify::Error::generic("chaos error")));
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        drop(tx);
+        handle
+            .join()
+            .expect("worker should survive mixed chaos events");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Debouncer: rapid same-path suppression ----------------------------
+
+    #[test]
+    fn debouncer_rapid_same_path_only_first_passes() {
+        let mut d = Debouncer::new(Duration::from_secs(60));
+        assert!(d.should_handle("same.txt"));
+        for _ in 0..100 {
+            assert!(!d.should_handle("same.txt"));
+        }
+    }
+
+    // -- Debouncer: empty string path --------------------------------------
+
+    #[test]
+    fn debouncer_empty_path() {
+        let mut d = Debouncer::new(Duration::from_millis(200));
+        assert!(d.should_handle(""));
+        assert!(!d.should_handle(""));
+    }
+
+    // -- Debouncer: unicode path -------------------------------------------
+
+    #[test]
+    fn debouncer_unicode_path() {
+        let mut d = Debouncer::new(Duration::from_secs(10));
+        assert!(d.should_handle("路径/文件.txt"));
+        assert!(!d.should_handle("路径/文件.txt"));
+        assert!(d.should_handle("дорожка/файл.txt"));
+    }
+
+    // -- Debouncer: very long path -----------------------------------------
+
+    #[test]
+    fn debouncer_very_long_path() {
+        let mut d = Debouncer::new(Duration::from_secs(10));
+        let long_path = "a/".repeat(5000) + "file.txt";
+        assert!(d.should_handle(&long_path));
+        assert!(!d.should_handle(&long_path));
+    }
+
+    // -- Debouncer: paths with special characters --------------------------
+
+    #[test]
+    fn debouncer_special_chars_in_path() {
+        let mut d = Debouncer::new(Duration::from_secs(10));
+        let specials = vec![
+            "file with spaces.txt",
+            "file\twith\ttabs.txt",
+            "file(1).txt",
+            "file[2].txt",
+            "file{3}.txt",
+            "file$var.txt",
+            "file#hash.txt",
+            "file@at.txt",
+            "file!bang.txt",
+            "file%percent.txt",
+        ];
+        for s in &specials {
+            assert!(d.should_handle(s), "first event for '{}' should pass", s);
+            assert!(
+                !d.should_handle(s),
+                "second event for '{}' should be suppressed",
+                s
+            );
+        }
+    }
+
+    // -- broadcast_inject_css with binary content --------------------------
+
+    #[test]
+    fn broadcast_inject_css_binary_content_still_encodes() {
+        let dir = std::env::temp_dir().join("watchd_test_inject_binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("binary.css");
+
+        // Write binary content (with null bytes).
+        let mut content = vec![0u8; 256];
+        for (i, byte) in content.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        std::fs::write(&css_path, &content).unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "binary.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        // Verify base64 roundtrip preserves binary content.
+        let b64 = parsed["content"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(decoded, content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- broadcast_inject_css with unicode filename -------------------------
+
+    #[test]
+    fn broadcast_inject_css_unicode_filename() {
+        let dir = std::env::temp_dir().join("watchd_test_inject_unicode_name");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("样式.css");
+        std::fs::write(&css_path, ".x { color: red; }").unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "样式.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+        assert_eq!(parsed["path"], "样式.css");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- notify_clients: auto mode with real CSS file ----------------------
+
+    #[test]
+    fn notify_clients_auto_mode_real_css_file_injects() {
+        let dir = std::env::temp_dir().join("watchd_test_notify_auto_real_css");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("real.css");
+        std::fs::write(&css_path, "body { margin: 0; }").unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        notify_clients(&btx, &css_path, "real.css", &NotifyMode::Auto, "auto-test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- try_reload_configs: multiple configs with complex patterns ---------
+
+    #[test]
+    fn try_reload_configs_complex_yaml() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_complex");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+- name: frontend
+  watch:
+    - "src/**/*.tsx"
+    - "src/**/*.ts"
+    - "public/**/*.html"
+  on_change: "npm run build"
+  build: "npm run build:prod"
+  notify: reload
+  ignore:
+    - "src/**/*.test.tsx"
+    - "node_modules/**"
+
+- name: styles
+  watch: "styles/**/*.css"
+  notify: inject-css
+
+- name: assets
+  watch:
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.svg"
+  notify: none
+  ignore:
+    - ".git/**"
+"#,
+        )
+        .unwrap();
+
+        let result = try_reload_configs(&cfg_path);
+        assert!(result.is_some());
+        let configs = result.unwrap();
+        assert_eq!(configs.len(), 3);
+        assert_eq!(configs[0].name, "frontend");
+        assert_eq!(configs[0].watches.len(), 3);
+        assert_eq!(configs[0].ignore.len(), 2);
+        assert!(configs[0].on_change.is_some());
+        assert!(configs[0].build.is_some());
+        assert_eq!(configs[1].name, "styles");
+        assert_eq!(configs[2].name, "assets");
+        assert_eq!(configs[2].watches.len(), 3);
+
+        // Verify watch sets were compiled.
+        for cfg in &configs {
+            assert!(
+                cfg.watch_set.is_some(),
+                "watch_set should be compiled for {}",
+                cfg.name
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- try_reload_configs: YAML with only whitespace and comments ---------
+
+    #[test]
+    fn try_reload_configs_whitespace_and_comments_only() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_comments");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(&cfg_path, "# just a comment\n\n  \n# another comment\n").unwrap();
+
+        let result = try_reload_configs(&cfg_path);
+        // Comments/whitespace produce zero configs → returns None.
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- run_command_blocking with path substitution -----------------------
+
+    #[test]
+    fn run_command_blocking_with_special_chars_in_args() {
+        // Command with quotes and special characters — should not panic.
+        run_command_blocking("echo \"hello world\"", None);
+        run_command_blocking("echo path/with spaces/file.txt", None);
+    }
+
+    // -- run_command_blocking timeout kills correctly ----------------------
+
+    #[test]
+    fn run_command_blocking_timeout_near_boundary() {
+        let start = Instant::now();
+        #[cfg(target_os = "windows")]
+        run_command_blocking("ping -n 100 127.0.0.1", Some(Duration::from_millis(200)));
+        #[cfg(not(target_os = "windows"))]
+        run_command_blocking("sleep 100", Some(Duration::from_millis(200)));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should have been killed quickly, took {:?}",
+            elapsed
+        );
+    }
+
+    // -- WorkerContext with diff store and config --------------------------
+
+    #[test]
+    fn worker_context_diff_store_with_config_match() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(vec!["css".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_diff_cfg");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let css_path = dir.join("app.css");
+        std::fs::write(&css_path, ".old { color: black; }").unwrap();
+
+        let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
+
+        let mut cfg = config::ConfigEntry {
+            name: "css".to_string(),
+            watches: vec!["**/*.css".to_string()],
+            watch_set: None,
+            on_change: Some("echo building css".to_string()),
+            build: None,
+            notify: NotifyMode::InjectCss,
+            ignore: vec![],
+        };
+        cfg.compile_watch_set();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![cfg],
+            statuses: statuses.clone(),
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: Some(Duration::from_secs(5)),
+            config_path: cfg_path,
+            diff_store: Some(diff_store.clone()),
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // "Change" the file.
+        std::fs::write(&css_path, ".new { color: white; }").unwrap();
+
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![css_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Should have an inject-css broadcast.
+        let msg = brx.try_recv().expect("should receive broadcast");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        // Diff store should have recorded the change.
+        let guard = diff_store.lock().unwrap();
+        assert!(
+            !guard.list_keys().is_empty(),
+            "diff store should have tracked the file"
+        );
+
+        // Status should have cycled through "reloading" back to "up to date".
+        drop(guard);
+        {
+            let st = statuses.lock().unwrap();
+            assert_eq!(st.get("css").map(|s| s.as_str()), Some("up to date"));
+        }
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: interleaved errors and valid events -----------------
+
+    #[test]
+    fn worker_context_interleaved_errors_and_events() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(32);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_interleaved");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let html_path = dir.join("test.html");
+        std::fs::write(&html_path, "<html></html>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo test".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(1)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Interleave errors and valid events.
+        tx.send(Err(notify::Error::generic("err1"))).unwrap();
+        let valid_event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![html_path.clone()],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(valid_event)).unwrap();
+        tx.send(Err(notify::Error::generic("err2"))).unwrap();
+        tx.send(Err(notify::Error::generic("err3"))).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The valid event should still produce a broadcast despite the errors.
+        let msg = brx
+            .try_recv()
+            .expect("valid event should produce broadcast");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle
+            .join()
+            .expect("worker should survive interleaved errors");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: debouncer suppresses duplicates ---------------------
+
+    #[test]
+    fn worker_context_debouncer_suppresses_within_window() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(32);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_debounce");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let html_path = dir.join("debounce.html");
+        std::fs::write(&html_path, "<html></html>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo debounce".to_string(),
+            debouncer: Debouncer::new(Duration::from_secs(60)), // Very long debounce.
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send the same event 10 times — only the first should produce a broadcast.
+        for _ in 0..10 {
+            let event = Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                paths: vec![html_path.clone()],
+                attrs: Default::default(),
+            };
+            tx.send(Ok(event)).unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Should receive exactly one broadcast.
+        let msg = brx.try_recv().expect("first event should broadcast");
+        assert!(msg.contains("reload"));
+        assert!(
+            brx.try_recv().is_err(),
+            "subsequent events should be debounced"
+        );
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- broadcast_reload JSON structure -----------------------------------
+
+    #[test]
+    fn broadcast_reload_message_is_minimal_json() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_reload(&btx, "any/path.txt", "cfg");
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        // Should only have a "type" field — no extra fields.
+        assert_eq!(parsed.as_object().unwrap().len(), 1);
+        assert_eq!(parsed["type"], "reload");
+    }
+
+    // -- broadcast_inject_css JSON structure --------------------------------
+
+    #[test]
+    fn broadcast_inject_css_message_has_three_fields() {
+        let dir = std::env::temp_dir().join("watchd_test_inject_fields");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("fields.css");
+        std::fs::write(&css_path, "p { padding: 0; }").unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "fields.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("path"));
+        assert!(obj.contains_key("content"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Debouncer: prune with lots of paths then re-use -------------------
+
+    #[test]
+    fn debouncer_heavy_prune_then_reuse() {
+        let mut d = Debouncer::new(Duration::from_millis(1));
+        d.prune_interval = 50;
+
+        // Insert many paths.
+        for i in 0..100 {
+            d.should_handle(&format!("path_{}.txt", i));
+        }
+
+        // Sleep so all entries become stale.
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Insert enough to trigger prune.
+        for i in 100..160 {
+            d.should_handle(&format!("path_{}.txt", i));
+        }
+
+        // Old entries should have been pruned.
+        assert!(
+            d.last_seen.len() < 120,
+            "stale entries should have been pruned, got {} entries",
+            d.last_seen.len()
+        );
+
+        // New entries should still be present.
+        assert!(d.last_seen.contains_key("path_159.txt"));
+    }
+
+    // -- Debouncer: window exactly at boundary -----------------------------
+
+    #[test]
+    fn debouncer_boundary_window() {
+        let mut d = Debouncer::new(Duration::from_millis(50));
+        assert!(d.should_handle("boundary.txt"));
+        // Sleep just past the window.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            d.should_handle("boundary.txt"),
+            "should pass after window expires"
+        );
+    }
+
+    // -- Connection tracking: high concurrency stress ----------------------
+
+    #[test]
+    fn connection_tracking_high_concurrency_stress() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        // 100 threads connecting.
+        for _ in 0..100 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                track_connect(&c);
+            }));
+        }
+        for h in handles.drain(..) {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 100);
+
+        // 100 threads disconnecting.
+        for _ in 0..100 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                track_disconnect(&c);
+            }));
+        }
+        for h in handles.drain(..) {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // Extra disconnects should saturate at 0.
+        for _ in 0..50 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                track_disconnect(&c);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    // -- Connection tracking: interleaved connect/disconnect from threads --
+
+    #[test]
+    fn connection_tracking_threaded_interleave() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        // Alternate connect and disconnect from many threads.
+        for i in 0..200 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    track_connect(&c);
+                } else {
+                    track_disconnect(&c);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 100 connects and 100 disconnects. Counter should be between 0 and 100
+        // depending on ordering. The key property is no panic and no wrap.
+        let val = counter.load(Ordering::Relaxed);
+        assert!(
+            val <= 100,
+            "counter should not exceed number of connects, got {}",
+            val
+        );
+    }
+
+    // -- notify_clients: auto mode with various extensions -----------------
+
+    #[test]
+    fn notify_clients_auto_mode_various_extensions() {
+        let extensions = vec![
+            ("file.js", "reload"),
+            ("file.ts", "reload"),
+            ("file.jsx", "reload"),
+            ("file.tsx", "reload"),
+            ("file.py", "reload"),
+            ("file.rb", "reload"),
+            ("file.go", "reload"),
+            ("file.rs", "reload"),
+            ("file.json", "reload"),
+            ("file.yaml", "reload"),
+            ("file.md", "reload"),
+            ("file.txt", "reload"),
+        ];
+
+        for (filename, expected_type) in extensions {
+            let (btx, mut brx) = broadcast::channel::<String>(8);
+            let path = Path::new(filename);
+            notify_clients(&btx, path, filename, &NotifyMode::Auto, "test");
+            let msg = brx
+                .try_recv()
+                .expect(&format!("should broadcast for {}", filename));
+            assert!(
+                msg.contains(expected_type),
+                "expected {} for {}, got: {}",
+                expected_type,
+                filename,
+                msg
+            );
+        }
+    }
+
+    // -- WorkerContext: config with on_change and build (on_change priority) -
+
+    #[test]
+    fn worker_context_on_change_takes_priority_over_build() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(vec!["test".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_priority");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let js_path = dir.join("app.js");
+        std::fs::write(&js_path, "console.log('hi');").unwrap();
+
+        let mut cfg = config::ConfigEntry {
+            name: "test".to_string(),
+            watches: vec!["**/*.js".to_string()],
+            watch_set: None,
+            on_change: Some("echo on_change ran".to_string()),
+            build: Some("echo build ran".to_string()),
+            notify: NotifyMode::Reload,
+            ignore: vec![],
+        };
+        cfg.compile_watch_set();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![cfg],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: Some(Duration::from_secs(5)),
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![js_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let msg = brx.try_recv().expect("should receive broadcast");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: config with no commands (notify only) ---------------
+
+    #[test]
+    fn worker_context_config_notify_only_no_command() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(vec!["notifyonly".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_notify_only");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let js_path = dir.join("script.js");
+        std::fs::write(&js_path, "var x = 1;").unwrap();
+
+        let mut cfg = config::ConfigEntry {
+            name: "notifyonly".to_string(),
+            watches: vec!["**/*.js".to_string()],
+            watch_set: None,
+            on_change: None, // No command.
+            build: None,     // No build either.
+            notify: NotifyMode::Reload,
+            ignore: vec![],
+        };
+        cfg.compile_watch_set();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![cfg],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![js_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Should still broadcast even without a command.
+        let msg = brx.try_recv().expect("should broadcast reload");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: multiple configs, first match wins ------------------
+
+    #[test]
+    fn worker_context_multiple_configs_all_matching_run() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(32);
+        let statuses =
+            crate::server::new_status_map(vec!["first".to_string(), "second".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_multi_cfg");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let css_path = dir.join("shared.css");
+        std::fs::write(&css_path, ".shared { display: block; }").unwrap();
+
+        // Both configs match *.css.
+        let mut cfg1 = config::ConfigEntry {
+            name: "first".to_string(),
+            watches: vec!["**/*.css".to_string()],
+            watch_set: None,
+            on_change: None,
+            build: None,
+            notify: NotifyMode::Reload,
+            ignore: vec![],
+        };
+        cfg1.compile_watch_set();
+
+        let mut cfg2 = config::ConfigEntry {
+            name: "second".to_string(),
+            watches: vec!["**/*.css".to_string()],
+            watch_set: None,
+            on_change: None,
+            build: None,
+            notify: NotifyMode::InjectCss,
+            ignore: vec![],
+        };
+        cfg2.compile_watch_set();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![cfg1, cfg2],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![css_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Both configs match, so we should get two broadcasts.
+        let msg1 = brx.try_recv().expect("first config should broadcast");
+        assert!(msg1.contains("reload")); // first config is Reload mode
+        let msg2 = brx.try_recv().expect("second config should broadcast");
+        assert!(msg2.contains("inject-css")); // second config is InjectCss mode
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: config with ignore patterns filters out paths -------
+
+    #[test]
+    fn worker_context_config_ignore_skips_matching_paths() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(vec!["filtered".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_cfg_ignore");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let js_path = dir.join("app.js");
+        std::fs::write(&js_path, "var y = 2;").unwrap();
+
+        // Config watches *.js but the global filter excludes *.js via ignore.
+        let mut cfg = config::ConfigEntry {
+            name: "filtered".to_string(),
+            watches: vec!["**/*.js".to_string()],
+            watch_set: None,
+            on_change: None,
+            build: None,
+            notify: NotifyMode::Reload,
+            ignore: vec![],
+        };
+        cfg.compile_watch_set();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        // Use the global filter to exclude *.js files.
+        let filter = PathFilter::new(&[], &["**/*.js".to_string()]);
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter,
+            configs: vec![cfg],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![js_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Global filter should block the path before config matching.
+        assert!(
+            brx.try_recv().is_err(),
+            "filtered path should produce no broadcast"
+        );
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: remove event for a file ----------------------------
+
+    #[test]
+    fn worker_context_remove_event_triggers_fallback() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_remove");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo removed".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: Some(Duration::from_secs(2)),
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // A remove event for a .rs file — should trigger generic fallback.
+        let event = Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::File),
+            paths: vec![dir.join("deleted.rs")],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let msg = brx
+            .try_recv()
+            .expect("remove event should produce broadcast");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: rename event (ModifyKind::Name) ---------------------
+
+    #[test]
+    fn worker_context_rename_event_is_processed() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_rename");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let old_path = dir.join("old.html");
+        let new_path = dir.join("new.html");
+        std::fs::write(&new_path, "<renamed>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo rename".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Rename event with both old and new paths.
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            paths: vec![old_path, new_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Should receive broadcasts for both the old and new paths.
+        let msg1 = brx
+            .try_recv()
+            .expect("rename should produce at least one broadcast");
+        assert!(msg1.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Chaos: rapid create/delete cycle ----------------------------------
+
+    #[test]
+    fn worker_context_rapid_create_delete_cycle() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _brx) = broadcast::channel::<String>(256);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_create_delete");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let diff_store = crate::kv::DiffStore::new_shared(10, 50, 4096);
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo cycle".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(1)),
+            cmd_timeout: Some(Duration::from_secs(1)),
+            config_path: cfg_path,
+            diff_store: Some(diff_store.clone()),
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Simulate rapid create → modify → remove cycles.
+        for i in 0..30 {
+            let file = dir.join(format!("ephemeral_{}.html", i % 5));
+
+            // Create.
+            std::fs::write(&file, format!("v{}", i)).unwrap();
+            tx.send(Ok(Event {
+                kind: EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![file.clone()],
+                attrs: Default::default(),
+            }))
+            .unwrap();
+
+            // Modify.
+            std::fs::write(&file, format!("v{}_modified", i)).unwrap();
+            tx.send(Ok(Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                paths: vec![file.clone()],
+                attrs: Default::default(),
+            }))
+            .unwrap();
+
+            // Remove.
+            let _ = std::fs::remove_file(&file);
+            tx.send(Ok(Event {
+                kind: EventKind::Remove(notify::event::RemoveKind::File),
+                paths: vec![file],
+                attrs: Default::default(),
+            }))
+            .unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(1000));
+
+        drop(tx);
+        handle
+            .join()
+            .expect("worker should survive create/delete chaos");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Chaos: concurrent senders on the channel --------------------------
+
+    #[test]
+    fn worker_context_concurrent_event_senders() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _brx) = broadcast::channel::<String>(512);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_concurrent_send");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        // Create files for the senders to reference.
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("f{}.html", i)), "<p>x</p>").unwrap();
+        }
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo concurrent".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(1)),
+            cmd_timeout: Some(Duration::from_secs(2)),
+            config_path: cfg_path,
+            diff_store: None,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Spawn 5 threads each sending 20 events.
+        let mut sender_handles = Vec::new();
+        for t in 0..5 {
+            let tx_clone = tx.clone();
+            let dir_clone = dir.clone();
+            sender_handles.push(std::thread::spawn(move || {
+                for i in 0..20 {
+                    let file_idx = (t * 4 + i) % 10;
+                    let event = Event {
+                        kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                            notify::event::DataChange::Content,
+                        )),
+                        paths: vec![dir_clone.join(format!("f{}.html", file_idx))],
+                        attrs: Default::default(),
+                    };
+                    let _ = tx_clone.send(Ok(event));
+                }
+            }));
+        }
+
+        for h in sender_handles {
+            h.join().unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        drop(tx);
+        handle
+            .join()
+            .expect("worker should survive concurrent senders");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- is_relevant_event: exhaustive ModifyKind::Other -------------------
+
+    #[test]
+    fn modify_kind_other_is_not_relevant() {
+        // ModifyKind::Other should be treated as non-relevant.
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Other
+        )));
+    }
+
+    // -- broadcast_reload with empty label and path ------------------------
+
+    #[test]
+    fn broadcast_reload_empty_strings() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_reload(&btx, "", "");
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "reload");
+    }
+
+    // -- notify_clients with all modes exhaustive --------------------------
+
+    #[test]
+    fn notify_clients_all_modes_no_panic() {
+        let modes = vec![
+            NotifyMode::Auto,
+            NotifyMode::Reload,
+            NotifyMode::InjectCss,
+            NotifyMode::None,
+        ];
+        let path = Path::new("test.txt");
+
+        for mode in &modes {
+            let (btx, _brx) = broadcast::channel::<String>(8);
+            // Should never panic regardless of mode.
+            notify_clients(&btx, path, "test.txt", mode, "exhaustive");
+        }
+    }
+
+    // -- try_reload_configs: UTF-8 BOM -------------------------------------
+
+    #[test]
+    fn try_reload_configs_utf8_bom() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_bom");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+
+        // UTF-8 BOM + valid YAML.  serde_yaml may or may not handle the BOM
+        // gracefully — the key property is that it must not panic.
+        let yaml = "\u{FEFF}- name: bom\n  watch: \"**/*.rs\"\n";
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let result = try_reload_configs(&cfg_path);
+        // Either it parses successfully or returns None (keeps previous).
+        if let Some(configs) = result {
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].name, "bom");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- WorkerContext: diff store records even for non-existent file -------
+
+    #[test]
+    fn worker_context_diff_store_handles_missing_file() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_diff_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+            diff_store: Some(diff_store.clone()),
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send event for a file that doesn't exist on disk.
+        let event = Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::File),
+            paths: vec![dir.join("gone.rs")],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Should not panic. Diff store might or might not record it — key
+        // property is no crash.
+
+        drop(tx);
+        handle
+            .join()
+            .expect("worker should handle missing file for diff");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

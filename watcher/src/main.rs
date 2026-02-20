@@ -38,6 +38,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cmd_template = args.cmd_template.clone();
     let bind_addr = args.bind_addr.clone();
 
+    // -----------------------------------------------------------------------
+    // --print-snippet: output the client <script> tag and exit
+    // -----------------------------------------------------------------------
+    // This check runs before control_port computation so that port 65535
+    // (which would overflow port + 1) works fine with --print-snippet.
+    if args.print_snippet {
+        print!("{}", client::snippet_help(args.port));
+        return Ok(());
+    }
+
     // The control socket lives on port + 1.  Guard against overflow so that
     // port 65535 doesn't silently wrap to 0 (debug panic / release wrap).
     let control_port = args.port.checked_add(1).unwrap_or_else(|| {
@@ -49,14 +59,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(1);
     });
     let control_addr = format!("{}:{}", bind_addr, control_port);
-
-    // -----------------------------------------------------------------------
-    // --print-snippet: output the client <script> tag and exit
-    // -----------------------------------------------------------------------
-    if args.print_snippet {
-        print!("{}", client::snippet_help(args.port));
-        return Ok(());
-    }
 
     // -----------------------------------------------------------------------
     // Client-mode subcommands (contact a running watchd instance and exit)

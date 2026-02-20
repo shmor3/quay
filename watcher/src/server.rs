@@ -1368,7 +1368,14 @@ mod tests {
         // Connect a WS client.
         let ws_url = format!("ws://{}", ws_addr);
         let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Poll until the counter reaches 1 (connect is detected).
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if counter.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+        }
 
         // Now status should show 1 connection.
         let response = control_send(&ctrl_addr, "{\"cmd\":\"status\"}\n").await;
@@ -1376,7 +1383,15 @@ mod tests {
         assert_eq!(parsed["connections"], 1);
 
         drop(ws);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Poll until the counter drops back to 0 (disconnect is detected).
+        // Use a generous timeout (up to 5 s) to avoid flakiness under load.
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if counter.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+        }
 
         // After disconnect, back to 0.
         let response = control_send(&ctrl_addr, "{\"cmd\":\"status\"}\n").await;
