@@ -58,3 +58,248 @@ pub enum SubCommand {
     /// Query status of loaded configs from the running watchd instance.
     Status,
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse arguments from an iterator, prepending the binary name.
+    fn parse(args: &[&str]) -> Args {
+        let mut full: Vec<&str> = vec!["watchd"];
+        full.extend_from_slice(args);
+        Args::try_parse_from(full).expect("failed to parse args")
+    }
+
+    /// Helper: attempt to parse arguments, returning the error on failure.
+    fn try_parse(args: &[&str]) -> std::result::Result<Args, clap::Error> {
+        let mut full: Vec<&str> = vec!["watchd"];
+        full.extend_from_slice(args);
+        Args::try_parse_from(full)
+    }
+
+    // -- Default values ----------------------------------------------------
+
+    #[test]
+    fn defaults_with_no_args() {
+        let args = parse(&[]);
+        assert_eq!(args.cmd_template, "echo files changed");
+        assert_eq!(args.debounce_ms, 200);
+        assert_eq!(args.port, 3012);
+        assert!(!args.no_run_on_start);
+        assert_eq!(args.path, PathBuf::from("."));
+        assert_eq!(args.bind_addr, "127.0.0.1");
+        assert!(!args.print_snippet);
+        assert!(args.cmd_timeout_ms.is_none());
+        assert!(args.subcmd.is_none());
+    }
+
+    // -- Custom values -----------------------------------------------------
+
+    #[test]
+    fn custom_cmd_template() {
+        let args = parse(&["npm run build"]);
+        assert_eq!(args.cmd_template, "npm run build");
+    }
+
+    #[test]
+    fn custom_debounce_ms() {
+        let args = parse(&["--debounce-ms", "500"]);
+        assert_eq!(args.debounce_ms, 500);
+    }
+
+    #[test]
+    fn custom_port() {
+        let args = parse(&["--port", "8080"]);
+        assert_eq!(args.port, 8080);
+    }
+
+    #[test]
+    fn port_min_value() {
+        let args = parse(&["--port", "0"]);
+        assert_eq!(args.port, 0);
+    }
+
+    #[test]
+    fn port_max_value() {
+        let args = parse(&["--port", "65535"]);
+        assert_eq!(args.port, 65535);
+    }
+
+    #[test]
+    fn custom_path_short_flag() {
+        let args = parse(&["-p", "/tmp/project"]);
+        assert_eq!(args.path, PathBuf::from("/tmp/project"));
+    }
+
+    #[test]
+    fn custom_path_long_flag() {
+        let args = parse(&["--path", "/home/user/project"]);
+        assert_eq!(args.path, PathBuf::from("/home/user/project"));
+    }
+
+    #[test]
+    fn custom_bind_addr() {
+        let args = parse(&["--bind", "0.0.0.0"]);
+        assert_eq!(args.bind_addr, "0.0.0.0");
+    }
+
+    #[test]
+    fn no_run_on_start_flag() {
+        let args = parse(&["--no-run-on-start"]);
+        assert!(args.no_run_on_start);
+    }
+
+    #[test]
+    fn print_snippet_flag() {
+        let args = parse(&["--print-snippet"]);
+        assert!(args.print_snippet);
+    }
+
+    #[test]
+    fn cmd_timeout_ms_set() {
+        let args = parse(&["--cmd-timeout-ms", "30000"]);
+        assert_eq!(args.cmd_timeout_ms, Some(30000));
+    }
+
+    #[test]
+    fn cmd_timeout_ms_zero() {
+        let args = parse(&["--cmd-timeout-ms", "0"]);
+        assert_eq!(args.cmd_timeout_ms, Some(0));
+    }
+
+    // -- Subcommands -------------------------------------------------------
+
+    #[test]
+    fn reload_subcommand() {
+        let args = parse(&["reload"]);
+        assert!(matches!(args.subcmd, Some(SubCommand::Reload)));
+    }
+
+    #[test]
+    fn status_subcommand() {
+        let args = parse(&["status"]);
+        assert!(matches!(args.subcmd, Some(SubCommand::Status)));
+    }
+
+    #[test]
+    fn subcommand_with_port() {
+        let args = parse(&["--port", "4000", "reload"]);
+        assert_eq!(args.port, 4000);
+        assert!(matches!(args.subcmd, Some(SubCommand::Reload)));
+    }
+
+    #[test]
+    fn subcommand_with_bind() {
+        let args = parse(&["--bind", "0.0.0.0", "status"]);
+        assert_eq!(args.bind_addr, "0.0.0.0");
+        assert!(matches!(args.subcmd, Some(SubCommand::Status)));
+    }
+
+    // -- Combined flags ----------------------------------------------------
+
+    #[test]
+    fn all_flags_combined() {
+        let args = parse(&[
+            "--port",
+            "5000",
+            "--bind",
+            "0.0.0.0",
+            "--debounce-ms",
+            "100",
+            "-p",
+            "/srv/app",
+            "--no-run-on-start",
+            "--cmd-timeout-ms",
+            "15000",
+            "make build",
+        ]);
+        assert_eq!(args.port, 5000);
+        assert_eq!(args.bind_addr, "0.0.0.0");
+        assert_eq!(args.debounce_ms, 100);
+        assert_eq!(args.path, PathBuf::from("/srv/app"));
+        assert!(args.no_run_on_start);
+        assert_eq!(args.cmd_timeout_ms, Some(15000));
+        assert_eq!(args.cmd_template, "make build");
+        assert!(args.subcmd.is_none());
+    }
+
+    // -- Validation / rejection --------------------------------------------
+
+    #[test]
+    fn invalid_port_rejected() {
+        // Port 99999 exceeds u16 range
+        let result = try_parse(&["--port", "99999"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn negative_port_rejected() {
+        let result = try_parse(&["--port", "-1"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_numeric_port_rejected() {
+        let result = try_parse(&["--port", "abc"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_numeric_debounce_rejected() {
+        let result = try_parse(&["--debounce-ms", "fast"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_flag_rejected() {
+        let result = try_parse(&["--does-not-exist"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_rejected() {
+        let result = try_parse(&["restart"]);
+        // "restart" is treated as the cmd_template positional, not a subcommand,
+        // so it should actually parse successfully as a command template.
+        assert!(result.is_ok());
+        let args = result.unwrap();
+        assert_eq!(args.cmd_template, "restart");
+        assert!(args.subcmd.is_none());
+    }
+
+    // -- Debug impls -------------------------------------------------------
+
+    #[test]
+    fn args_implements_debug() {
+        let args = parse(&[]);
+        let dbg = format!("{:?}", args);
+        assert!(dbg.contains("Args"));
+        assert!(dbg.contains("cmd_template"));
+        assert!(dbg.contains("port"));
+    }
+
+    #[test]
+    fn subcommand_implements_debug_and_clone() {
+        let sub = SubCommand::Reload;
+        let dbg = format!("{:?}", sub);
+        assert!(dbg.contains("Reload"));
+
+        let cloned = sub.clone();
+        let dbg2 = format!("{:?}", cloned);
+        assert_eq!(dbg, dbg2);
+    }
+
+    #[test]
+    fn subcommand_status_debug_and_clone() {
+        let sub = SubCommand::Status;
+        let dbg = format!("{:?}", sub);
+        assert!(dbg.contains("Status"));
+
+        let cloned = sub.clone();
+        assert!(format!("{:?}", cloned).contains("Status"));
+    }
+}

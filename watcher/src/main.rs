@@ -36,7 +36,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = cli::Args::parse();
     let cmd_template = args.cmd_template.clone();
     let bind_addr = args.bind_addr.clone();
-    let control_addr = format!("{}:{}", bind_addr, args.port + 1);
+
+    // The control socket lives on port + 1.  Guard against overflow so that
+    // port 65535 doesn't silently wrap to 0 (debug panic / release wrap).
+    let control_port = args.port.checked_add(1).unwrap_or_else(|| {
+        error!(
+            port = args.port,
+            "port value too high; control socket requires port + 1 but {} + 1 overflows u16",
+            args.port
+        );
+        std::process::exit(1);
+    });
+    let control_addr = format!("{}:{}", bind_addr, control_port);
 
     // -----------------------------------------------------------------------
     // --print-snippet: output the client <script> tag and exit

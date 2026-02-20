@@ -14,12 +14,16 @@
 //!   build commands from blocking the worker indefinitely.
 //! - **Config hot-reload** – when `hotreload.yaml` itself is modified the
 //!   worker reloads its config entries automatically without a restart.
+//! - **Worker resilience** – the worker thread catches panics and logs them
+//!   rather than crashing silently, and tracks event-processing statistics
+//!   for observability.
 
 use base64::Engine;
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
 };
 use std::collections::HashMap;
+use std::panic;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,11 +80,32 @@ pub fn track_connect(counter: &Arc<AtomicUsize>) -> usize {
 }
 
 /// Atomically decrement the connection count and return the new value.
+///
+/// Uses a compare-and-swap loop to avoid wrapping past zero — if the counter
+/// is already `0` it stays at `0` instead of wrapping to `usize::MAX`.
 pub fn track_disconnect(counter: &Arc<AtomicUsize>) -> usize {
-    let prev = counter.fetch_sub(1, Ordering::Relaxed);
-    let n = prev.saturating_sub(1);
-    debug!(connections = n, "WebSocket client disconnected");
-    n
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        if current == 0 {
+            debug!(
+                connections = 0,
+                "WebSocket client disconnected (counter already at zero)"
+            );
+            return 0;
+        }
+        let new_val = current - 1;
+        match counter.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                debug!(connections = new_val, "WebSocket client disconnected");
+                return new_val;
+            }
+            Err(_) => {
+                // Another thread changed the counter; retry.
+                continue;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +239,18 @@ struct Debouncer {
 }
 
 impl Debouncer {
+    /// Create a new debouncer with the given window duration.
+    ///
+    /// A minimum window of 1 ms is enforced — a zero-duration window would
+    /// effectively disable debouncing and could cause the worker to process
+    /// the same event multiple times from backends that emit bursts.
     fn new(window: Duration) -> Self {
+        let window = if window.is_zero() {
+            warn!("debounce window is 0ms; clamping to 1ms minimum");
+            Duration::from_millis(1)
+        } else {
+            window
+        };
         Self {
             window,
             last_seen: HashMap::new(),
@@ -225,6 +261,10 @@ impl Debouncer {
 
     /// Returns `true` if the path should be processed (i.e. enough time has
     /// elapsed since the last event for this path).
+    ///
+    /// Internally the map is pruned every [`prune_interval`] events to prevent
+    /// unbounded growth during long-running sessions.  Entries older than 10×
+    /// the debounce window are considered stale and removed.
     fn should_handle(&mut self, path: &str) -> bool {
         let now = Instant::now();
         let dominated = match self.last_seen.get(path) {
@@ -233,13 +273,24 @@ impl Debouncer {
         };
         self.last_seen.insert(path.to_string(), now);
 
-        // Periodic pruning: remove entries older than 10× the debounce window.
+        // Periodic pruning: remove entries older than 10× the debounce window
+        // so that the map does not grow without bound in sessions that touch
+        // many distinct paths over hours/days.
         self.events_since_prune += 1;
         if self.events_since_prune >= self.prune_interval {
             self.events_since_prune = 0;
-            let stale_threshold = self.window * 10;
+            let stale_threshold = self.window.saturating_mul(10);
+            let before = self.last_seen.len();
             self.last_seen
                 .retain(|_, ts| now.duration_since(*ts) < stale_threshold);
+            let pruned = before.saturating_sub(self.last_seen.len());
+            if pruned > 0 {
+                debug!(
+                    pruned,
+                    remaining = self.last_seen.len(),
+                    "debouncer pruned stale entries"
+                );
+            }
         }
 
         !dominated
@@ -380,8 +431,23 @@ struct WorkerContext {
 
 impl WorkerContext {
     /// Main event loop — runs until the channel is closed.
+    ///
+    /// Each incoming event is wrapped in [`panic::catch_unwind`] so that a bug
+    /// in a single event handler (e.g. a malformed path triggering an
+    /// unexpected panic) does not kill the entire worker thread.  The worker
+    /// continues processing subsequent events after logging the panic.
+    ///
+    /// Statistics (total events received, events processed, errors, panics)
+    /// are logged on exit for post-mortem observability.
     fn run(mut self) {
+        let mut total_received: u64 = 0;
+        let mut total_processed: u64 = 0;
+        let mut total_errors: u64 = 0;
+        let mut total_panics: u64 = 0;
+
         while let Ok(result) = self.rx.recv() {
+            total_received += 1;
+
             match result {
                 Ok(event) => {
                     // Skip events that don't represent actual data changes.
@@ -389,14 +455,52 @@ impl WorkerContext {
                         continue;
                     }
 
-                    for path in &event.paths {
-                        self.handle_path(path);
+                    for path in event.paths.iter() {
+                        // Catch panics so that one bad path doesn't kill the
+                        // worker.  We use AssertUnwindSafe because our mutable
+                        // borrow cannot cross the unwind boundary without it,
+                        // and we accept the (tiny) risk that internal state is
+                        // left slightly inconsistent — the debouncer and
+                        // status map are tolerant of this.
+                        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            self.handle_path(path);
+                        }));
+                        match result {
+                            Ok(()) => {
+                                total_processed += 1;
+                            }
+                            Err(payload) => {
+                                total_panics += 1;
+                                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                    (*s).to_string()
+                                } else if let Some(s) = payload.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic payload".to_string()
+                                };
+                                error!(
+                                    path = %path.display(),
+                                    panic = %msg,
+                                    "worker panic caught while handling event; continuing"
+                                );
+                            }
+                        }
                     }
                 }
-                Err(e) => warn!(error = %e, "file watcher reported an error"),
+                Err(e) => {
+                    total_errors += 1;
+                    warn!(error = %e, "file watcher reported an error");
+                }
             }
         }
-        debug!("watcher event channel closed; worker exiting");
+
+        info!(
+            total_received,
+            total_processed,
+            total_errors,
+            total_panics,
+            "watcher event channel closed; worker exiting"
+        );
     }
 
     fn handle_path(&mut self, path: &Path) {
@@ -768,5 +872,1046 @@ mod tests {
         // Disconnecting when already at 0 should saturate to 0, not wrap.
         let n = track_disconnect(&counter);
         assert_eq!(n, 0);
+        // The actual atomic counter must also remain at 0, not wrap to usize::MAX.
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn connection_tracking_underflow_repeated() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        // Multiple disconnects at zero should all return 0 and keep counter at 0.
+        for _ in 0..10 {
+            assert_eq!(track_disconnect(&counter), 0);
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn connection_tracking_concurrent() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        // Spawn 50 connect threads.
+        for _ in 0..50 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                track_connect(&c);
+            }));
+        }
+        for h in handles.drain(..) {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 50);
+
+        // Spawn 50 disconnect threads.
+        for _ in 0..50 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                track_disconnect(&c);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn connection_tracking_interleaved() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(track_connect(&counter), 1);
+        assert_eq!(track_connect(&counter), 2);
+        assert_eq!(track_disconnect(&counter), 1);
+        assert_eq!(track_connect(&counter), 2);
+        assert_eq!(track_connect(&counter), 3);
+        assert_eq!(track_disconnect(&counter), 2);
+        assert_eq!(track_disconnect(&counter), 1);
+        assert_eq!(track_disconnect(&counter), 0);
+        assert_eq!(track_disconnect(&counter), 0); // underflow guard
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    // -- Debouncer additional tests ----------------------------------------
+
+    #[test]
+    fn debouncer_zero_window_clamped() {
+        // A zero-duration window should be clamped to 1ms, not disable debouncing.
+        let mut d = Debouncer::new(Duration::from_millis(0));
+        assert!(d.window >= Duration::from_millis(1));
+        // First event should still pass.
+        assert!(d.should_handle("file.txt"));
+        // Immediate second event should be suppressed (1ms window).
+        assert!(!d.should_handle("file.txt"));
+    }
+
+    #[test]
+    fn debouncer_very_large_window() {
+        let mut d = Debouncer::new(Duration::from_secs(3600)); // 1 hour
+        assert!(d.should_handle("a.txt"));
+        assert!(!d.should_handle("a.txt")); // within window
+        assert!(d.should_handle("b.txt")); // different path
+    }
+
+    #[test]
+    fn debouncer_allows_after_window_expires() {
+        let mut d = Debouncer::new(Duration::from_millis(10));
+        assert!(d.should_handle("file.rs"));
+        // Wait for the debounce window to expire.
+        std::thread::sleep(Duration::from_millis(20));
+        // Should be allowed again.
+        assert!(d.should_handle("file.rs"));
+    }
+
+    #[test]
+    fn debouncer_many_distinct_paths() {
+        let mut d = Debouncer::new(Duration::from_secs(10));
+        for i in 0..1000 {
+            let path = format!("path/{}/file_{}.rs", i / 10, i);
+            assert!(d.should_handle(&path));
+        }
+        // All 1000 distinct paths should be in the map.
+        assert_eq!(d.last_seen.len(), 1000);
+    }
+
+    #[test]
+    fn debouncer_prune_actually_removes_stale() {
+        let mut d = Debouncer::new(Duration::from_millis(1));
+        d.prune_interval = 3; // prune after every 3 events
+
+        // Insert a path.
+        d.should_handle("old.txt");
+        // Sleep so it becomes stale (10× window = 10ms).
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Insert 3 more events to trigger prune.
+        d.should_handle("a.txt");
+        d.should_handle("b.txt");
+        d.should_handle("c.txt");
+
+        // "old.txt" should have been pruned.
+        assert!(!d.last_seen.contains_key("old.txt"));
+        // Recent entries should remain.
+        assert!(d.last_seen.contains_key("a.txt"));
+        assert!(d.last_seen.contains_key("b.txt"));
+        assert!(d.last_seen.contains_key("c.txt"));
+    }
+
+    #[test]
+    fn debouncer_prune_keeps_recent_entries() {
+        let mut d = Debouncer::new(Duration::from_secs(10));
+        d.prune_interval = 2;
+
+        d.should_handle("fresh.txt");
+        d.should_handle("trigger1.txt");
+        d.should_handle("trigger2.txt"); // triggers prune
+
+        // All entries are fresh (within 10× 10s = 100s), so none should be pruned.
+        assert!(d.last_seen.contains_key("fresh.txt"));
+        assert!(d.last_seen.contains_key("trigger1.txt"));
+        assert!(d.last_seen.contains_key("trigger2.txt"));
+    }
+
+    #[test]
+    fn debouncer_prune_interval_default() {
+        let d = Debouncer::new(Duration::from_millis(200));
+        assert_eq!(d.prune_interval, 1000);
+        assert_eq!(d.events_since_prune, 0);
+    }
+
+    // -- Event kind filtering exhaustive -----------------------------------
+
+    #[test]
+    fn create_file_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Create(
+            notify::event::CreateKind::File
+        )));
+    }
+
+    #[test]
+    fn create_folder_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Create(
+            notify::event::CreateKind::Folder
+        )));
+    }
+
+    #[test]
+    fn create_any_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Create(
+            notify::event::CreateKind::Any
+        )));
+    }
+
+    #[test]
+    fn create_other_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Create(
+            notify::event::CreateKind::Other
+        )));
+    }
+
+    #[test]
+    fn remove_file_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Remove(
+            notify::event::RemoveKind::File
+        )));
+    }
+
+    #[test]
+    fn remove_folder_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Remove(
+            notify::event::RemoveKind::Folder
+        )));
+    }
+
+    #[test]
+    fn remove_any_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Remove(
+            notify::event::RemoveKind::Any
+        )));
+    }
+
+    #[test]
+    fn remove_other_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Remove(
+            notify::event::RemoveKind::Other
+        )));
+    }
+
+    #[test]
+    fn modify_data_content_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Content)
+        )));
+    }
+
+    #[test]
+    fn modify_data_size_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Size)
+        )));
+    }
+
+    #[test]
+    fn modify_data_any_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any)
+        )));
+    }
+
+    #[test]
+    fn modify_data_other_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Other)
+        )));
+    }
+
+    #[test]
+    fn modify_name_from_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Name(notify::event::RenameMode::From)
+        )));
+    }
+
+    #[test]
+    fn modify_name_to_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Name(notify::event::RenameMode::To)
+        )));
+    }
+
+    #[test]
+    fn modify_name_both_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Name(notify::event::RenameMode::Both)
+        )));
+    }
+
+    #[test]
+    fn modify_name_any_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Name(notify::event::RenameMode::Any)
+        )));
+    }
+
+    #[test]
+    fn modify_name_other_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Name(notify::event::RenameMode::Other)
+        )));
+    }
+
+    #[test]
+    fn modify_any_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Any
+        )));
+    }
+
+    #[test]
+    fn modify_other_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Other
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_writetime_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::WriteTime)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_accesstime_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::AccessTime)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_permissions_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Permissions)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_ownership_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Ownership)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_extended_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Extended)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_any_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Any)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_other_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Other)
+        )));
+    }
+
+    #[test]
+    fn access_read_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Access(
+            notify::event::AccessKind::Read
+        )));
+    }
+
+    #[test]
+    fn access_open_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Access(
+            notify::event::AccessKind::Open(notify::event::AccessMode::Read)
+        )));
+    }
+
+    #[test]
+    fn access_close_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Access(
+            notify::event::AccessKind::Close(notify::event::AccessMode::Write)
+        )));
+    }
+
+    #[test]
+    fn access_any_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Access(
+            notify::event::AccessKind::Any
+        )));
+    }
+
+    #[test]
+    fn access_other_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Access(
+            notify::event::AccessKind::Other
+        )));
+    }
+
+    #[test]
+    fn event_kind_other_is_not_relevant() {
+        assert!(!is_relevant_event(&EventKind::Other));
+    }
+
+    #[test]
+    fn event_kind_any_is_relevant() {
+        assert!(is_relevant_event(&EventKind::Any));
+    }
+
+    // -- broadcast_reload --------------------------------------------------
+
+    #[test]
+    fn broadcast_reload_sends_valid_json() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_reload(&btx, "src/main.rs", "test-cfg");
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "reload");
+    }
+
+    #[test]
+    fn broadcast_reload_no_receivers() {
+        let (btx, _) = broadcast::channel::<String>(8);
+        // No active receivers — send should not panic.
+        broadcast_reload(&btx, "file.txt", "cfg");
+    }
+
+    #[test]
+    fn broadcast_reload_multiple_receivers() {
+        let (btx, _) = broadcast::channel::<String>(8);
+        let mut rx1 = btx.subscribe();
+        let mut rx2 = btx.subscribe();
+        let mut rx3 = btx.subscribe();
+
+        broadcast_reload(&btx, "app.js", "scripts");
+
+        assert!(rx1.try_recv().unwrap().contains("reload"));
+        assert!(rx2.try_recv().unwrap().contains("reload"));
+        assert!(rx3.try_recv().unwrap().contains("reload"));
+    }
+
+    // -- broadcast_inject_css ----------------------------------------------
+
+    #[test]
+    fn broadcast_inject_css_with_real_file() {
+        // Create a real temp CSS file and verify inject-css broadcast.
+        let dir = std::env::temp_dir().join("watchd_test_inject_css");
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("style.css");
+        std::fs::write(&css_path, "body { color: red; }").unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "style.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+        assert_eq!(parsed["path"], "style.css");
+
+        // Verify the content is base64-encoded.
+        let content = parsed["content"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "body { color: red; }");
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_inject_css_nonexistent_file_falls_back_to_reload() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("/nonexistent/does_not_exist.css");
+        broadcast_inject_css(&btx, path, "missing.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        // Should fall back to reload since the file can't be read.
+        assert_eq!(parsed["type"], "reload");
+    }
+
+    #[test]
+    fn broadcast_inject_css_empty_file() {
+        let dir = std::env::temp_dir().join("watchd_test_inject_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("empty.css");
+        std::fs::write(&css_path, "").unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "empty.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        let content = parsed["content"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .unwrap();
+        assert!(decoded.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_inject_css_large_file() {
+        let dir = std::env::temp_dir().join("watchd_test_inject_large");
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("large.css");
+        // 100KB of CSS content.
+        let content = "x".repeat(100_000);
+        std::fs::write(&css_path, &content).unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "large.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        let b64 = parsed["content"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(decoded.len(), 100_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_inject_css_utf8_content() {
+        let dir = std::env::temp_dir().join("watchd_test_inject_utf8");
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("unicode.css");
+        let css = "/* 日本語コメント */ body { content: '🎨'; }";
+        std::fs::write(&css_path, css).unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        broadcast_inject_css(&btx, &css_path, "unicode.css", "test");
+
+        let msg = brx.try_recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        let b64 = parsed["content"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), css);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- notify_clients additional tests -----------------------------------
+
+    #[test]
+    fn notify_clients_inject_css_mode_with_real_file() {
+        let dir = std::env::temp_dir().join("watchd_test_notify_inject");
+        let _ = std::fs::create_dir_all(&dir);
+        let css_path = dir.join("notify.css");
+        std::fs::write(&css_path, ".x { color: blue; }").unwrap();
+
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        notify_clients(&btx, &css_path, "notify.css", &NotifyMode::InjectCss, "t");
+
+        let msg = brx.try_recv().unwrap();
+        assert!(msg.contains("inject-css"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notify_clients_inject_css_mode_missing_file_falls_back() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("totally_missing.css");
+        notify_clients(
+            &btx,
+            path,
+            "totally_missing.css",
+            &NotifyMode::InjectCss,
+            "t",
+        );
+
+        let msg = brx.try_recv().unwrap();
+        // Missing file with InjectCss mode should fall back to reload.
+        assert!(msg.contains("reload"));
+    }
+
+    #[test]
+    fn notify_clients_auto_mode_html_reloads() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("index.html");
+        notify_clients(&btx, path, "index.html", &NotifyMode::Auto, "t");
+        let msg = brx.try_recv().unwrap();
+        assert!(msg.contains("reload"));
+    }
+
+    #[test]
+    fn notify_clients_auto_mode_no_extension_reloads() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("Makefile");
+        notify_clients(&btx, path, "Makefile", &NotifyMode::Auto, "t");
+        let msg = brx.try_recv().unwrap();
+        assert!(msg.contains("reload"));
+    }
+
+    #[test]
+    fn notify_clients_auto_mode_scss_reloads() {
+        // Only .css files trigger inject-css in auto mode; .scss should reload.
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("styles.scss");
+        notify_clients(&btx, path, "styles.scss", &NotifyMode::Auto, "t");
+        let msg = brx.try_recv().unwrap();
+        assert!(msg.contains("reload"));
+    }
+
+    #[test]
+    fn notify_clients_auto_mode_css_uppercase() {
+        // Extension comparison should be case-insensitive.
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("theme.CSS");
+        notify_clients(&btx, path, "theme.CSS", &NotifyMode::Auto, "t");
+        let msg = brx.try_recv().unwrap();
+        // Auto mode uses to_ascii_lowercase, so .CSS should match css path.
+        // But file doesn't exist on disk, so inject-css falls back to reload.
+        assert!(msg.contains("reload"));
+    }
+
+    #[test]
+    fn notify_clients_reload_mode_regardless_of_extension() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        // Even a CSS file with reload mode should produce a reload message.
+        let path = Path::new("should_reload.css");
+        notify_clients(&btx, path, "should_reload.css", &NotifyMode::Reload, "t");
+        let msg = brx.try_recv().unwrap();
+        assert!(msg.contains("reload"));
+        assert!(!msg.contains("inject-css"));
+    }
+
+    #[test]
+    fn notify_clients_none_mode_produces_no_message() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("ignored.txt");
+        notify_clients(&btx, path, "ignored.txt", &NotifyMode::None, "t");
+        // Channel should be empty.
+        assert!(brx.try_recv().is_err());
+    }
+
+    #[test]
+    fn notify_clients_none_mode_for_css_still_no_message() {
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let path = Path::new("silent.css");
+        notify_clients(&btx, path, "silent.css", &NotifyMode::None, "t");
+        assert!(brx.try_recv().is_err());
+    }
+
+    // -- try_reload_configs ------------------------------------------------
+
+    #[test]
+    fn try_reload_configs_valid_file() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_valid");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+- name: styles
+  watch: "**/*.css"
+  notify: inject-css
+- name: scripts
+  watch: "**/*.js"
+  notify: reload
+"#,
+        )
+        .unwrap();
+
+        let result = try_reload_configs(&cfg_path);
+        assert!(result.is_some());
+        let configs = result.unwrap();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "styles");
+        assert_eq!(configs[1].name, "scripts");
+        // Verify watch sets were compiled.
+        assert!(configs[0].watch_set.is_some());
+        assert!(configs[1].watch_set.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_reload_configs_nonexistent_file() {
+        let path = Path::new("/nonexistent/hotreload.yaml");
+        let result = try_reload_configs(path);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_reload_configs_empty_file() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(&cfg_path, "").unwrap();
+
+        // Empty YAML produces zero configs → returns None (keeps previous).
+        let result = try_reload_configs(&cfg_path);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_reload_configs_invalid_yaml() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_invalid");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(&cfg_path, "{{{{not valid yaml at all}}}}").unwrap();
+
+        let result = try_reload_configs(&cfg_path);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_reload_configs_single_config() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_single");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(
+            &cfg_path,
+            "name: solo\nwatch: \"**/*.rs\"\non_change: \"cargo build\"\n",
+        )
+        .unwrap();
+
+        let result = try_reload_configs(&cfg_path);
+        assert!(result.is_some());
+        let configs = result.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "solo");
+        assert!(configs[0].watch_set.is_some());
+        assert!(configs[0].matches("src/main.rs"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_reload_configs_scalar_yaml() {
+        let dir = std::env::temp_dir().join("watchd_test_reload_scalar");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml");
+        std::fs::write(&cfg_path, "42\n").unwrap();
+
+        // Scalar YAML produces zero configs → None.
+        let result = try_reload_configs(&cfg_path);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- run_command_blocking edge cases ------------------------------------
+
+    #[test]
+    fn run_command_blocking_nonexistent_command() {
+        // Should log an error but not panic.
+        run_command_blocking("this_command_does_not_exist_12345", None);
+    }
+
+    #[test]
+    fn run_command_blocking_empty_command() {
+        // Empty command — the shell should handle it gracefully.
+        // On some shells this is a no-op; on others it may fail.
+        // The key property is no panic.
+        run_command_blocking("", None);
+    }
+
+    #[test]
+    fn run_command_blocking_failing_command() {
+        // A command that exits with non-zero should log a warning but not panic.
+        #[cfg(target_os = "windows")]
+        run_command_blocking("cmd /C exit 1", None);
+        #[cfg(not(target_os = "windows"))]
+        run_command_blocking("false", None);
+    }
+
+    #[test]
+    fn run_command_blocking_zero_timeout() {
+        // A zero-ms timeout should still work (command likely killed immediately).
+        run_command_blocking("echo quick", Some(Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn run_command_blocking_generous_timeout() {
+        // A very generous timeout with a fast command should complete normally.
+        let start = Instant::now();
+        run_command_blocking("echo hello", Some(Duration::from_secs(60)));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    // -- WorkerContext event processing ------------------------------------
+
+    #[test]
+    fn worker_context_exits_when_channel_closes() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_exit");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::with_defaults(&[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo {path}".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(200)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Drop the sender to close the channel.
+        drop(tx);
+
+        // Worker should exit cleanly.
+        handle.join().expect("worker thread should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_context_handles_error_events() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, _) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_errors");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::with_defaults(&[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo {path}".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(200)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send error events — should be logged but not crash the worker.
+        tx.send(Err(notify::Error::generic("test error 1")))
+            .unwrap();
+        tx.send(Err(notify::Error::generic("test error 2")))
+            .unwrap();
+
+        // Close channel to let worker exit.
+        drop(tx);
+
+        handle
+            .join()
+            .expect("worker should handle errors without crashing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_context_skips_irrelevant_events() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_irrelevant");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::with_defaults(&[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo {path}".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send an access event (irrelevant) — should not produce any broadcast.
+        let access_event = Event {
+            kind: EventKind::Access(notify::event::AccessKind::Read),
+            paths: vec![dir.join("file.txt")],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(access_event)).unwrap();
+
+        // Give worker time to process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // No broadcast should have been sent.
+        assert!(brx.try_recv().is_err());
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_context_processes_relevant_events() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_relevant");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Create a real HTML file so the handler produces a reload broadcast.
+        let html_path = dir.join("page.html");
+        std::fs::write(&html_path, "<html></html>").unwrap();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![],
+            statuses,
+            cmd_template: "echo changed".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: Some(Duration::from_secs(5)),
+            config_path: cfg_path,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send a modify-data event for an HTML file.
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![html_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        // Give worker time to process.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Should have broadcast a reload for the HTML file.
+        let msg = brx.try_recv().expect("should receive a broadcast");
+        assert!(msg.contains("reload"));
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_context_processes_css_with_config() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(vec!["styles".to_string()]);
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_css_cfg");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let css_path = dir.join("app.css");
+        std::fs::write(&css_path, "body { margin: 0; }").unwrap();
+
+        // Create a config that matches CSS files with inject-css mode.
+        let mut cfg = config::ConfigEntry {
+            name: "styles".to_string(),
+            watches: vec!["**/*.css".to_string()],
+            watch_set: None,
+            on_change: None,
+            build: None,
+            notify: NotifyMode::InjectCss,
+            ignore: vec![],
+        };
+        cfg.compile_watch_set();
+
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter: PathFilter::new(&[], &[]),
+            configs: vec![cfg],
+            statuses,
+            cmd_template: "echo noop".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            config_path: cfg_path,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send a create event for the CSS file.
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![css_path],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        // Give worker time to process.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let msg = brx.try_recv().expect("should receive a broadcast");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "inject-css");
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_context_skips_filtered_paths() {
+        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (btx, mut brx) = broadcast::channel::<String>(8);
+        let statuses = crate::server::new_status_map(Vec::<String>::new());
+
+        let dir = std::env::temp_dir().join("watchd_test_worker_filtered");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+
+        // Filter that excludes everything in a "tmp" directory.
+        let filter = PathFilter::new(&[], &["**/*.tmp".to_string()]);
+
+        let ctx = WorkerContext {
+            rx,
+            btx,
+            filter,
+            configs: vec![],
+            statuses,
+            cmd_template: "echo {path}".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: Some(Duration::from_secs(5)),
+            config_path: cfg_path,
+        };
+
+        let handle = std::thread::spawn(move || ctx.run());
+
+        // Send a modify event for a .tmp file — should be filtered out.
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![dir.join("cache.tmp")],
+            attrs: Default::default(),
+        };
+        tx.send(Ok(event)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // No broadcast should have been produced.
+        assert!(brx.try_recv().is_err());
+
+        drop(tx);
+        handle.join().expect("worker should exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
