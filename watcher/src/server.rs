@@ -776,7 +776,7 @@ mod tests {
         let store = DiffStore::new_shared(5, 10, 8);
         {
             let mut guard = store.lock().unwrap();
-            guard.record_change("big.txt", &vec![b'X'; 20]);
+            guard.record_change("big.txt", &[b'X'; 20]);
         }
         let resp = handle_diff_cmd(&Some(store), Some("big.txt"));
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();

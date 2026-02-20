@@ -246,7 +246,10 @@ mod tests {
 
     #[test]
     fn result_alias_ok() {
-        let r: Result<i32> = Ok(42);
+        fn returns_ok() -> Result<i32> {
+            Ok(42)
+        }
+        let r = returns_ok();
         assert_eq!(r.unwrap(), 42);
     }
 
@@ -265,7 +268,7 @@ mod tests {
     fn all_variants_implement_debug() {
         // Ensures Debug is derived and does not panic for any variant.
         let variants: Vec<WatchdError> = vec![
-            WatchdError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x")),
+            WatchdError::Io(std::io::Error::other("x")),
             WatchdError::Notify(notify::Error::generic("x")),
             WatchdError::WebSocket(Box::new(
                 tokio_tungstenite::tungstenite::Error::ConnectionClosed,
@@ -280,7 +283,7 @@ mod tests {
             },
             WatchdError::Bind {
                 addr: "e".into(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, "f"),
+                source: std::io::Error::other("f"),
             },
             WatchdError::CommandExec {
                 cmd: "g".into(),
@@ -288,7 +291,7 @@ mod tests {
             },
             WatchdError::ControlConnect {
                 addr: "i".into(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, "j"),
+                source: std::io::Error::other("j"),
             },
         ];
         for v in &variants {

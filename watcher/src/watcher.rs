@@ -2458,7 +2458,7 @@ mod tests {
         for kind in &kinds {
             for path in &paths {
                 let event = Event {
-                    kind: kind.clone(),
+                    kind: *kind,
                     paths: vec![path.clone()],
                     attrs: Default::default(),
                 };
@@ -3113,7 +3113,7 @@ mod tests {
             notify_clients(&btx, path, filename, &NotifyMode::Auto, "test");
             let msg = brx
                 .try_recv()
-                .expect(&format!("should broadcast for {}", filename));
+                .unwrap_or_else(|_| panic!("should broadcast for {}", filename));
             assert!(
                 msg.contains(expected_type),
                 "expected {} for {}, got: {}",

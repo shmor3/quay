@@ -396,7 +396,7 @@ fn is_binary(data: &[u8]) -> bool {
 /// * When there is no old content the entire new file is shown as additions.
 fn compute_diff(old: Option<&[u8]>, new: &[u8]) -> (String, bool) {
     let new_is_binary = is_binary(new);
-    let old_is_binary = old.map_or(false, is_binary);
+    let old_is_binary = old.is_some_and(is_binary);
 
     if new_is_binary || old_is_binary {
         return ("<binary file changed>".to_string(), true);
