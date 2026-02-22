@@ -4,6 +4,36 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 
 ## Features
 
+---
+
+> **Operational features added:** Prometheus metrics, log enrichment, health/readiness endpoints, reliability/scalability improvements.
+
+## Operational Features
+
+- **Monitoring:** Prometheus metrics exposed on `127.0.0.1:9090` (health, reload count, WebSocket connections, diff count).
+- **Logging:** Structured logs enriched with tracing and operational events.
+- **Reliability:** Health/readiness endpoint, worker watchdog, graceful shutdown.
+- **Scalability:** Bounded diff store, connection tracking, metrics for scaling.
+- **Operational Endpoints:** `/metrics` (Prometheus), health gauge, reload counter, WebSocket connection gauge.
+
+### Prometheus Metrics
+- `watchd_health`: Health status (1=healthy, 0=unhealthy)
+- `watchd_reload_count`: Reload events triggered
+- `watchd_ws_connections`: Active WebSocket connections
+- `watchd_diff_count`: Total diffs in store
+
+### Health/Readiness
+- Health endpoint on port 9090 returns Prometheus metrics
+- Worker watchdog updates health gauge
+
+### Logging
+- All major events are logged with tracing (startup, shutdown, errors, reloads, health changes)
+
+### Reliability/Scalability
+- Graceful shutdown on worker failure
+- Bounded diff store prevents memory exhaustion
+- Connection tracking for operational visibility
+
 - **Recursive directory watching** with configurable debounce
 - **YAML-based configuration** (`hotreload.yaml`) for per-project build/run logic
 - **WebSocket server** broadcasts `reload` and `inject-css` messages to connected browsers
@@ -54,6 +84,89 @@ The codebase is split into focused, single-responsibility modules:
 - **`validate.rs`** centralises input validation (bind address, debounce range, port warnings, diff flag consistency) to keep `main.rs` focused on orchestration.
 
 ## Quick start
+
+### Setup
+
+1. Install Rust from https://rustup.rs
+2. Clone the repository and build:
+   ```bash
+   cargo build --manifest-path watcher/Cargo.toml
+   ```
+3. Run the watcher:
+   ```bash
+   cargo run --manifest-path watcher/Cargo.toml -- --path .
+   ```
+
+### Configuration
+
+- Place a `hotreload.yaml` file in the watch root. See below for config fields and examples.
+- Use CLI flags to override defaults (see CLI section).
+
+#### Example hotreload.yaml
+
+```yaml
+- name: styles
+  watch: "src/**/*.css"
+  notify: inject-css
+- name: scripts
+  watch:
+    - "src/**/*.ts"
+    - "src/**/*.js"
+  on_change: "npm run build"
+  notify: reload
+```
+
+### Troubleshooting
+
+- **Watcher fails to start:**
+  - Check for errors in the console.
+  - Invalid YAML: check for syntax errors.
+  - Port in use: try a different port.
+  - Permission denied: check directory access.
+- **No reload/inject-css in browser:**
+  - Ensure the client script is included in your HTML.
+  - Check WebSocket port matches the server.
+  - Use browser console logs for debugging.
+- **Diff store not working:**
+  - Start watcher with `--diff` flag.
+  - Check file size limits (`--diff-max-file-size`).
+
+### Common Errors
+
+- `Failed to parse hotreload.yaml`: Fix YAML syntax and required fields.
+- `Bind error`: Port/address in use or invalid.
+- `Command failed`: Check your `on_change` command.
+- `Diff store disabled`: Use `--diff` flag.
+
+### FAQ
+
+**Q: How do I add hotreload to my HTML page?**
+A: Use `watchd --print-snippet` or copy `hotreload-client.js` to your static assets.
+
+**Q: Can I use this with any language?**
+A: Yes, configs are language-agnostic.
+
+**Q: How do I debug file events?**
+A: Set `RUST_LOG=debug` for verbose logs.
+
+**Q: How do I run multiple configs?**
+A: Use a YAML sequence in `hotreload.yaml`.
+
+**Q: What if my build command hangs?**
+A: Use `--cmd-timeout-ms` to kill stuck commands.
+
+**Q: How do I clear diffs?**
+A: Use the `diff-clear` control command.
+
+**Q: How do I expose the server to other machines?**
+A: Use `--bind 0.0.0.0` (see Security Considerations).
+
+**Q: How do I get help?**
+A: Run `watchd --help` or see this README.
+
+---
+
+For practical guidance, see the expanded sections below.
 
 Build:
 

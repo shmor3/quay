@@ -76,6 +76,10 @@ pub fn spawn_control_server(
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
     diff_store: Option<SharedDiffStore>,
+    auth_token: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    max_connections: Option<u32>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -94,7 +98,7 @@ pub fn spawn_control_server(
                             let counter = connection_count.clone();
                             let diff_store = diff_store.clone();
                             tokio::spawn(async move {
-                                handle_control_client(socket, btx, statuses, cancel, counter, diff_store).await;
+                                handle_control_client(socket, btx, statuses, cancel, counter, diff_store, None, None).await;
                             });
                         }
                         Err(e) => {
@@ -127,6 +131,8 @@ async fn handle_control_client(
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
     diff_store: Option<SharedDiffStore>,
+    auth_token: Option<String>,
+    max_connections: Option<u32>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 

@@ -26,6 +26,70 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 
 ## Quick start
 
+### Setup
+
+1. Install Rust (https://rustup.rs) if not already installed.
+2. Clone the repository: `git clone <repo-url>`
+3. Build the watcher binary:
+   ```bash
+   cargo build --manifest-path watcher/Cargo.toml
+   ```
+4. Run the watcher:
+   ```bash
+   cargo run --manifest-path watcher/Cargo.toml -- --path .
+   ```
+5. Optionally, copy the produced binary from `watcher/target/debug/watchd` to your PATH for easier usage.
+
+### Configuration
+
+- Place a `hotreload.yaml` file in your project root. See below and `watcher/README.md` for config details.
+- Use CLI flags to override defaults (see below).
+
+### Troubleshooting
+
+- If the watcher does not start, check for errors in the console. Common issues:
+  - Invalid YAML config: check for syntax errors in `hotreload.yaml`.
+  - Port already in use: change the `--port` flag or stop other processes.
+  - Permission denied: ensure you have access to the watch path.
+- For detailed logs, set `RUST_LOG=debug`.
+
+### Common Errors
+
+- `Failed to parse hotreload.yaml`: Check YAML syntax and required fields.
+- `Bind error`: Port/address in use or invalid. Try a different port/address.
+- `Command failed`: Check your `on_change` command for correctness.
+- `Diff store disabled`: Use `--diff` flag to enable diff tracking.
+
+### FAQ
+
+**Q: How do I add hotreload to my HTML page?**
+A: Use `watchd --print-snippet` to get the script tag, or copy `hotreload-client.js` to your static assets.
+
+**Q: Can I use this with any language?**
+A: Yes, configs are language-agnostic. Use `on_change` to run any build command.
+
+**Q: How do I debug file events?**
+A: Set `RUST_LOG=debug` and check the console output for event details.
+
+**Q: How do I run multiple configs?**
+A: Use a YAML sequence in `hotreload.yaml` (see examples).
+
+**Q: What if my build command hangs?**
+A: Use `--cmd-timeout-ms` to kill stuck commands automatically.
+
+**Q: How do I clear diffs?**
+A: Use the `diff-clear` control command: `watchd --port <port> diff-clear`.
+
+**Q: How do I expose the server to other machines?**
+A: Use `--bind 0.0.0.0` but beware of security risks (see Security Considerations).
+
+**Q: How do I get help?**
+A: Run `watchd --help` or consult `watcher/README.md` for full documentation.
+
+---
+
+For more practical guidance, see the expanded sections below and `watcher/README.md`.
+
 Build the watcher binary and run:
 
 ```bash

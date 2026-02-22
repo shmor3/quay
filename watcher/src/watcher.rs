@@ -540,7 +540,7 @@ pub fn start(
         let timeout = cmd_timeout;
         std::thread::spawn(move || {
             info!(cmd = %cmd, "running startup command");
-            run_command_blocking(&cmd, timeout);
+            run_command_blocking(&cmd, timeout, None, None);
         });
     }
 

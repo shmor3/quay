@@ -6,7 +6,13 @@ use std::path::PathBuf;
 /// A minimal, language-agnostic file watcher that runs commands on changes
 /// and broadcasts reload or CSS-inject messages to browser clients via WebSocket.
 #[derive(Parser, Debug)]
-#[command(name = "watchd", version, about)]
+#[command(
+    name = "watchd",
+    version,
+    about = "A minimal, language-agnostic file watcher that runs commands on changes and broadcasts reload or CSS-inject messages to browser clients via WebSocket.",
+    long_about = "USAGE:\n    watchd [OPTIONS] [CMD_TEMPLATE]\n\nEXAMPLES:\n    # Run the watcher server and watch a directory\n    watchd --path /path/to/project --port 3012\n\n    # Use a command timeout to kill stuck builds after 30 seconds\n    watchd --path . --cmd-timeout-ms 30000\n\n    # Enable the diff store to track file changes\n    watchd --path . --diff\n\n    # Print the browser client snippet for embedding\n    watchd --print-snippet\n\n    # Query status (client-mode subcommand)\n    watchd --port 3012 status\n\n    # Trigger reload (client-mode subcommand)\n    watchd --port 3012 reload\n\n    # Query the latest diff for a file (client-mode subcommand)\n    watchd --port 3012 diff --path src/styles/main.css\n\nOPTIONS:\n    -p, --path <PATH>           Directory to watch and where to look for hotreload.yaml [default: .]\n    --port <PORT>               WebSocket server port [default: 3012]\n    --bind <ADDR>               Address to bind the WebSocket and control servers to [default: 127.0.0.1]\n    --debounce-ms <MS>          Debounce delay in milliseconds [default: 200]\n    --no-run-on-start           Do not run configured commands on startup\n    --cmd-timeout-ms <MS>       Maximum time to wait for a command before killing it\n    --print-snippet             Print the HTML <script> snippet for embedding the client, then exit\n    --diff                      Enable the in-memory diff store for file change tracking\n    --diff-max-file-size <B>    Maximum file size (bytes) the diff store will process (ignored without --diff) [default: 524288]\n\nSUBCOMMANDS:\n    reload                     Force a reload: run configured build/on_change commands and broadcast a reload message\n    status                     Query status of loaded configs from the running watchd instance\n    diff                       Query stored file diffs from the running watchd instance. Shows the latest diff for a specific file, or lists all tracked files\n",
+    help_template = "{about}\n\n{usage}\n\n{all-args}\n\n{after-help}"
+)]
 pub struct Args {
     /// Command template to run on changes. Use `{path}` to substitute the changed file path.
     #[arg(default_value = "echo files changed")]
@@ -66,16 +72,17 @@ pub struct Args {
 /// Client-mode subcommands that contact the running watchd control socket.
 #[derive(Subcommand, Debug, Clone)]
 pub enum SubCommand {
-    /// Force a reload: run configured build/on_change commands and broadcast a `reload` message.
+    /// Force a reload: run configured build/on_change commands and broadcast a reload message to all browser clients.
+    #[command(about = "Force a reload: run configured build/on_change commands and broadcast a reload message to all browser clients.")]
     Reload,
-    /// Query status of loaded configs from the running watchd instance.
+    /// Query status of loaded configs and active WebSocket connections from the running watchd instance.
+    #[command(about = "Query status of loaded configs and active WebSocket connections from the running watchd instance.")]
     Status,
-    /// Query stored file diffs from the running watchd instance.
-    /// Shows the latest diff for a specific file, or lists all tracked files.
+    /// Query stored file diffs from the running watchd instance. Shows the latest diff for a specific file, or lists all tracked files.
+    #[command(about = "Query stored file diffs from the running watchd instance. Shows the latest diff for a specific file, or lists all tracked files.")]
     Diff {
-        /// File path to show the diff for.  When omitted, lists all tracked
-        /// files with a summary.
-        #[arg(long = "path")]
+        /// File path to show the diff for. When omitted, lists all tracked files with a summary.
+        #[arg(long = "path", help = "File path to show the diff for. When omitted, lists all tracked files with a summary.")]
         path: Option<String>,
     },
 }

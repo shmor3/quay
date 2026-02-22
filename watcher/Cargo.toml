@@ -22,6 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 similar = "2.6"
+prometheus = "0.13"
 
 [[bin]]
 name = "watchd"

@@ -45,6 +45,8 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use prometheus::{Encoder, TextEncoder, Registry, IntGauge, IntCounter};
+use std::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -56,6 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .with_target(false)
         .init();
+
+    // Prometheus metrics setup
+    let registry = Registry::new();
+    let health_gauge = IntGauge::new("watchd_health", "Health status of watchd").unwrap();
+    let reload_counter = IntCounter::new("watchd_reload_count", "Reload events").unwrap();
+    registry.register(Box::new(health_gauge.clone())).unwrap();
+    registry.register(Box::new(reload_counter.clone())).unwrap();
+    let registry = Arc::new(Mutex::new(registry));
 
     let args = cli::Args::parse();
     let cmd_template = args.cmd_template.clone();
@@ -74,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // -----------------------------------------------------------------------
     // Input validation (beyond what clap's type system enforces)
     // -----------------------------------------------------------------------
-    if let Err(msg) = validate::validate_bind_addr(&bind_addr) {
+    if let Err(msg) = validate::validate_bind_addr(&bind_addr, false) {
         error!("{msg}");
         std::process::exit(1);
     }
@@ -177,7 +187,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 configs = parsed;
             }
-            Err(e) => warn!(path = %cfg_path.display(), error = %e, "failed to read config file"),
+            Err(e) => {
+    warn!(path = %cfg_path.display(), error = %e, "failed to read config file");
+    eprintln!("Actionable guidance: Could not read hotreload.yaml. Please check file permissions and YAML syntax.");
+}
         }
     } else {
         info!(
@@ -219,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|e| error::WatchdError::Bind {
             addr: ws_addr.clone(),
             source: e,
+            user_message: Some("Failed to bind WebSocket server. Check address and port.".to_string()),
         })?;
     info!(addr = %ws_addr, "WebSocket server listening");
 
@@ -244,6 +258,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         btx.clone(),
         cancel.clone(),
         connection_count.clone(),
+        None, // tls_cert
+        None, // tls_key
+        None, // max_connections
     );
     control::spawn_control_server(
         ctrl_listener,
@@ -252,7 +269,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cancel.clone(),
         connection_count.clone(),
         diff_store.clone(),
+        None, // auth_token
+        None, // tls_cert
+        None, // tls_key
+        None, // max_connections
     );
+
+    // Health/readiness endpoint
+    let registry_clone = registry.clone();
+    tokio::spawn(async move {
+        let health_addr = "127.0.0.1:9090";
+        let listener = TcpListener::bind(health_addr).await.unwrap();
+        info!(addr = %health_addr, "health endpoint listening");
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let registry = registry_clone.lock().unwrap();
+            let mut buffer = Vec::new();
+            let encoder = TextEncoder::new();
+            let mf = registry.gather();
+            encoder.encode(&mf, &mut buffer).unwrap();
+            use tokio::io::AsyncWriteExt;
+let _ = socket.write_all(&buffer).await;
+        }
+    });
 
     // Start the file-system watcher and blocking event worker.
     // We keep `_watcher` alive so that `notify` continues delivering events.
@@ -280,7 +319,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wait for Ctrl-C to initiate graceful shutdown.
     match tokio::signal::ctrl_c().await {
         Ok(()) => info!("received Ctrl-C; shutting down"),
-        Err(e) => error!(error = %e, "failed to listen for Ctrl-C"),
+        Err(e) => {
+    error!(error = %e, "failed to listen for Ctrl-C");
+    eprintln!("Actionable guidance: Unable to listen for Ctrl-C. Try running with proper terminal permissions.");
+}
     }
 
     // Signal all tasks to stop.

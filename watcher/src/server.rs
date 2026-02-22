@@ -23,6 +23,7 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use prometheus::IntGauge;
 
 use crate::watcher;
 
@@ -80,12 +81,17 @@ pub fn spawn_ws_server(
     btx: broadcast::Sender<String>,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    max_connections: Option<u32>,
 ) {
+    let ws_gauge = IntGauge::new("watchd_ws_connections", "WebSocket connections").unwrap();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
                     info!("WebSocket accept loop shutting down");
+                    ws_gauge.set(0);
                     break;
                 }
                 result = listener.accept() => {
@@ -94,14 +100,15 @@ pub fn spawn_ws_server(
                             let peer_btx = btx.clone();
                             let peer_cancel = cancel.clone();
                             let peer_counter = connection_count.clone();
+                            let ws_gauge = ws_gauge.clone();
                             tokio::spawn(async move {
-                                handle_ws_client(stream, addr, peer_btx, peer_cancel, peer_counter).await;
+                                ws_gauge.inc();
+                                handle_ws_client(stream, addr, peer_btx, peer_cancel, peer_counter, None).await;
+                                ws_gauge.dec();
                             });
                         }
                         Err(e) => {
                             error!(error = %e, "WebSocket listener accept error; retrying in 1s");
-                            // Sleep briefly to avoid a tight error loop (e.g. EMFILE),
-                            // then continue accepting instead of killing the server.
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             continue;
                         }
@@ -129,6 +136,7 @@ async fn handle_ws_client(
     btx: broadcast::Sender<String>,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
+    max_connections: Option<u32>,
 ) {
     // Apply a timeout to the WebSocket handshake so that a client that opens a
     // raw TCP connection but never sends the HTTP Upgrade request cannot hold

@@ -1,0 +1,29 @@
+# GitHub Actions CI for hotreload
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Build
+        run: cargo build --manifest-path watcher/Cargo.toml
+      - name: Test
+        run: cargo test --manifest-path watcher/Cargo.toml
+      - name: Lint (Clippy)
+        run: cargo clippy --manifest-path watcher/Cargo.toml -- -D warnings
+      - name: Format
+        run: cargo fmt -- --check

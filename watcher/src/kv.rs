@@ -28,6 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::{debug, warn};
+use prometheus::IntGauge;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -104,6 +105,8 @@ pub struct DiffStore {
     /// Files larger than this produce a placeholder entry and their content
     /// is **not** stored as a snapshot.
     max_file_size: usize,
+    /// Prometheus gauge for diff count
+    diff_gauge: IntGauge,
 }
 
 impl std::fmt::Debug for DiffStore {
@@ -139,6 +142,7 @@ impl DiffStore {
         let capacity = capacity.max(1);
         let max_keys = max_keys.max(1);
         let max_file_size = max_file_size.max(1);
+        let diff_gauge = IntGauge::new("watchd_diff_count", "Total diffs in store").unwrap();
         Self {
             diffs: HashMap::new(),
             snapshots: HashMap::new(),
@@ -146,6 +150,7 @@ impl DiffStore {
             capacity,
             max_keys,
             max_file_size,
+            diff_gauge,
         }
     }
 
@@ -214,6 +219,7 @@ impl DiffStore {
 
         self.insert_entry(path, entry.clone());
 
+        self.diff_gauge.set(self.diffs.values().map(|v| v.len() as i64).sum());
         Some(entry)
     }
 

@@ -81,7 +81,7 @@ pub fn shell_escape(s: &str) -> String {
 /// Errors are logged but do **not** propagate — a failing build command should
 /// not crash the watcher.  Non-zero exit codes are logged at `warn` level;
 /// spawn/wait failures are logged at `error` level.
-pub fn run_command_blocking(cmd: &str, timeout: Option<Duration>) {
+pub fn run_command_blocking(cmd: &str, timeout: Option<Duration>, max_memory_mb: Option<u32>, max_cpu_seconds: Option<u32>) {
     let result = {
         #[cfg(target_os = "windows")]
         {

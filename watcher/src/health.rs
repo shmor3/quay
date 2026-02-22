@@ -37,6 +37,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use prometheus::IntGauge;
 
 // ---------------------------------------------------------------------------
 // Constants

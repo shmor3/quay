@@ -6,7 +6,6 @@ description = "Example watchd hot-reload client for Rust"
 license = "MIT"
 publish = false
 
-[workspace]
 
 [dependencies]
 tungstenite = "0.21"

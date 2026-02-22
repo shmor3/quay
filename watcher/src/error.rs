@@ -8,37 +8,44 @@ use std::path::PathBuf;
 /// future use by downstream consumers of this module.
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
+use notify;
+
 pub enum WatchdError {
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error, Option<String>),
 
     #[error("file watcher error: {0}")]
-    Notify(#[from] notify::Error),
+    Notify(notify::Error, Option<String>),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] Box<tokio_tungstenite::tungstenite::Error>),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>, Option<String>),
 
     #[error("failed to parse config at {path}: {reason}")]
-    ConfigParse { path: PathBuf, reason: String },
+    ConfigParse { path: PathBuf, reason: String, user_message: Option<String> },
 
     #[error("invalid glob pattern '{pattern}': {reason}")]
-    InvalidGlob { pattern: String, reason: String },
+    InvalidGlob { pattern: String, reason: String, user_message: Option<String> },
 
     #[error("failed to bind to {addr}: {source}")]
     Bind {
         addr: String,
         #[source]
         source: std::io::Error,
+        user_message: Option<String>,
+    },
+
+        user_message: Option<String>,
     },
 
     #[error("failed to execute command '{cmd}': {reason}")]
-    CommandExec { cmd: String, reason: String },
+    CommandExec { cmd: String, reason: String, user_message: Option<String> },
 
     #[error("failed to connect to control socket at {addr}: {source}")]
     ControlConnect {
         addr: String,
         #[source]
         source: std::io::Error,
+        user_message: Option<String>,
     },
 }
 
@@ -68,7 +75,7 @@ mod tests {
     #[test]
     fn notify_error_display() {
         let inner = notify::Error::generic("watcher exploded");
-        let err = WatchdError::Notify(inner);
+        let err = WatchdError::Notify(inner, Some("Check file watcher configuration and supported events.".to_string()));
         let msg = err.to_string();
         assert!(msg.contains("file watcher error"), "got: {msg}");
         assert!(msg.contains("watcher exploded"), "got: {msg}");
@@ -77,7 +84,7 @@ mod tests {
     #[test]
     fn websocket_error_display() {
         let inner = tokio_tungstenite::tungstenite::Error::ConnectionClosed;
-        let err = WatchdError::WebSocket(Box::new(inner));
+        let err = WatchdError::WebSocket(Box::new(inner), Some("Check WebSocket server address and port.".to_string()));
         let msg = err.to_string();
         assert!(msg.contains("WebSocket error"), "got: {msg}");
     }
@@ -154,21 +161,21 @@ mod tests {
     fn from_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let err: WatchdError = io_err.into();
-        assert!(matches!(err, WatchdError::Io(_)));
+        assert!(matches!(err, WatchdError::Io(_, _)));
     }
 
     #[test]
     fn from_notify_error() {
         let notify_err = notify::Error::generic("boom");
         let err: WatchdError = notify_err.into();
-        assert!(matches!(err, WatchdError::Notify(_)));
+        assert!(matches!(err, WatchdError::Notify(_, _)));
     }
 
     #[test]
     fn from_boxed_websocket_error() {
         let ws_err = Box::new(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
         let err: WatchdError = ws_err.into();
-        assert!(matches!(err, WatchdError::WebSocket(_)));
+        assert!(matches!(err, WatchdError::WebSocket(_, _)));
     }
 
     // -- Source chains -----------------------------------------------------
@@ -268,11 +275,11 @@ mod tests {
     fn all_variants_implement_debug() {
         // Ensures Debug is derived and does not panic for any variant.
         let variants: Vec<WatchdError> = vec![
-            WatchdError::Io(std::io::Error::other("x")),
-            WatchdError::Notify(notify::Error::generic("x")),
+            WatchdError::Io(std::io::Error::other("x"), None),
+            WatchdError::Notify(notify::Error::generic("x"), None),
             WatchdError::WebSocket(Box::new(
                 tokio_tungstenite::tungstenite::Error::ConnectionClosed,
-            )),
+            ), None),
             WatchdError::ConfigParse {
                 path: PathBuf::from("a"),
                 reason: "b".into(),
