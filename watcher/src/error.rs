@@ -34,9 +34,6 @@ pub enum WatchdError {
         user_message: Option<String>,
     },
 
-        user_message: Option<String>,
-    },
-
     #[error("failed to execute command '{cmd}': {reason}")]
     CommandExec { cmd: String, reason: String, user_message: Option<String> },
 
