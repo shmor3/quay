@@ -29,7 +29,7 @@ pub const DEFAULT_WS_PORT: u16 = 3012;
 pub const CLIENT_JS: &str = r#"(function(){
   "use strict";
 
-  var DEFAULT_PORT = 3012;
+  var DEFAULT_PORT = /*PORT_PLACEHOLDER*/3012;
 
   // Try to read a custom port from the <script> tag's data-port attribute.
   var scriptEl = document.currentScript;
@@ -157,15 +157,7 @@ pub const CLIENT_JS: &str = r#"(function(){
 /// This is useful for injecting directly into an HTML response without needing
 /// to serve a separate `.js` file.
 pub fn inline_script_tag(port: u16) -> String {
-    // Replace the hardcoded DEFAULT_PORT in the JS with the actual port.
-    let js = if port != DEFAULT_WS_PORT {
-        CLIENT_JS.replace(
-            &format!("var DEFAULT_PORT = {};", DEFAULT_WS_PORT),
-            &format!("var DEFAULT_PORT = {};", port),
-        )
-    } else {
-        CLIENT_JS.to_string()
-    };
+    let js = CLIENT_JS.replace("/*PORT_PLACEHOLDER*/3012", &port.to_string());
 
     format!("<script>{}</script>", js)
 }
@@ -287,7 +279,10 @@ mod tests {
 
     #[test]
     fn client_js_default_port_matches_constant() {
-        let needle = format!("var DEFAULT_PORT = {};", DEFAULT_WS_PORT);
+        let needle = format!(
+            "var DEFAULT_PORT = /*PORT_PLACEHOLDER*/{};",
+            DEFAULT_WS_PORT
+        );
         assert!(
             CLIENT_JS.contains(&needle),
             "CLIENT_JS should contain '{}' but doesn't",

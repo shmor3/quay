@@ -82,7 +82,7 @@ cargo test --manifest-path watcher/Cargo.toml -- --test-threads=4
 - `tokio-tungstenite 0.20` — async WebSocket server
 - `tokio-util 0.7` — `CancellationToken` for coordinated shutdown
 - `clap 4.3` (derive) — CLI argument parsing
-- `serde + serde_yaml 0.9` — YAML config deserialization
+- `serde + serde_yml` — YAML config deserialization
 - `serde_json 1.0` — JSON for WebSocket messages and control protocol
 - `globset 0.4` — glob pattern matching for file filtering
 - `tracing + tracing-subscriber 0.3` — structured logging with env-filter

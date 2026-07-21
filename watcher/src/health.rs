@@ -1,9 +1,9 @@
 //! Worker thread health monitoring and self-healing.
 //!
-//! This module provides a lightweight quayog that monitors the worker thread
+//! This module provides a lightweight watchdog that monitors the worker thread
 //! spawned by [`crate::watcher::start`].  If the worker thread terminates
 //! unexpectedly (panic that escapes `catch_unwind`, or any other fatal error),
-//! the quayog detects this and triggers a coordinated shutdown via the
+//! the watchdog detects this and triggers a coordinated shutdown via the
 //! [`CancellationToken`] so that the rest of the application (WebSocket server,
 //! control socket) does not continue running in a degraded state with no file
 //! watcher.
@@ -58,8 +58,8 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// ```ignore
 /// let handle = std::thread::spawn(|| { /* worker loop */ });
-/// let quayog = WorkerWatchdog::new(handle, cancel.clone());
-/// quayog.spawn();
+/// let watchdog = WorkerWatchdog::new(handle, cancel.clone());
+/// watchdog.spawn();
 /// ```
 pub struct WorkerWatchdog {
     /// Join handle for the worker thread.
@@ -71,7 +71,7 @@ pub struct WorkerWatchdog {
 }
 
 impl WorkerWatchdog {
-    /// Create a new quayog for the given worker thread.
+    /// Create a new watchdog for the given worker thread.
     pub fn new(handle: JoinHandle<()>, cancel: CancellationToken) -> Self {
         Self {
             handle: Some(handle),
@@ -89,7 +89,7 @@ impl WorkerWatchdog {
             warn!(
                 requested_ms = interval.as_millis() as u64,
                 min_ms = MIN_POLL_INTERVAL.as_millis() as u64,
-                "quayog poll interval too low; clamping to minimum"
+                "watchdog poll interval too low; clamping to minimum"
             );
             MIN_POLL_INTERVAL
         } else {
@@ -98,13 +98,13 @@ impl WorkerWatchdog {
         self
     }
 
-    /// Spawn the quayog as a background Tokio task.
+    /// Spawn the watchdog as a background Tokio task.
     ///
     /// The task runs until:
     /// - The worker thread terminates (triggers shutdown), or
     /// - The cancellation token is cancelled (normal shutdown).
     ///
-    /// Returns a [`tokio::task::JoinHandle`] for the quayog task itself,
+    /// Returns a [`tokio::task::JoinHandle`] for the watchdog task itself,
     /// which can be awaited if desired but is not required.
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         let cancel = self.cancel.clone();
@@ -117,7 +117,7 @@ impl WorkerWatchdog {
         tokio::spawn(async move {
             info!(
                 poll_interval_ms = poll_interval.as_millis() as u64,
-                "worker quayog started"
+                "worker watchdog started"
             );
 
             // We cannot call `handle.join()` from an async context (it blocks),
@@ -126,29 +126,24 @@ impl WorkerWatchdog {
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => {
-                        info!("worker quayog: shutdown signal received; stopping");
+                        info!("worker watchdog: shutdown signal received; stopping");
                         // Normal shutdown — try to join the worker thread to
                         // ensure clean exit.  Use a bounded wait so we don't
                         // hang forever if the worker is stuck.
                         let join_deadline = tokio::time::sleep(Duration::from_secs(5));
                         tokio::pin!(join_deadline);
 
-                        // Spawn a blocking task to join the thread so we can
-                        // race it against the deadline.
-                        let join_result = tokio::task::spawn_blocking(move || {
-                            handle.join()
-                        });
-
-                        tokio::select! {
-                            result = join_result => {
-                                match result {
-                                    Ok(Ok(())) => info!("worker thread joined cleanly"),
-                                    Ok(Err(_)) => warn!("worker thread panicked during shutdown"),
-                                    Err(e) => warn!(error = %e, "failed to join worker thread"),
-                                }
+                        loop {
+                            if handle.is_finished() {
+                                info!("worker thread joined cleanly");
+                                break;
                             }
-                            () = &mut join_deadline => {
-                                warn!("worker thread did not exit within 5s; abandoning join");
+                            tokio::select! {
+                                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                () = &mut join_deadline => {
+                                    warn!("worker thread did not exit within 5s; abandoning join");
+                                    break;
+                                }
                             }
                         }
 
@@ -262,10 +257,10 @@ mod tests {
 
         wd.spawn();
 
-        // Wait for the quayog to detect the dead thread.
+        // Wait for the watchdog to detect the dead thread.
         tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
             .await
-            .expect("quayog should have cancelled within 5s");
+            .expect("watchdog should have cancelled within 5s");
 
         assert!(cancel.is_cancelled());
     }
@@ -287,10 +282,10 @@ mod tests {
 
         wd.spawn();
 
-        // Wait for the quayog to detect the panic.
+        // Wait for the watchdog to detect the panic.
         tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
             .await
-            .expect("quayog should have cancelled within 5s");
+            .expect("watchdog should have cancelled within 5s");
 
         assert!(cancel.is_cancelled());
     }
@@ -313,9 +308,9 @@ mod tests {
         let wd = WorkerWatchdog::new(handle, cancel.clone())
             .with_poll_interval(Duration::from_millis(500));
 
-        let quayog_task = wd.spawn();
+        let watchdog_task = wd.spawn();
 
-        // Give the quayog a moment to start.
+        // Give the watchdog a moment to start.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Trigger normal shutdown.
@@ -323,10 +318,10 @@ mod tests {
         cancel.cancel();
 
         // Watchdog task should complete.
-        tokio::time::timeout(Duration::from_secs(10), quayog_task)
+        tokio::time::timeout(Duration::from_secs(10), watchdog_task)
             .await
-            .expect("quayog task should complete within 10s")
-            .expect("quayog task should not panic");
+            .expect("watchdog task should complete within 10s")
+            .expect("watchdog task should not panic");
     }
 
     // -- Long-running worker is not falsely flagged ------------------------
@@ -353,7 +348,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(
             !cancel.is_cancelled(),
-            "quayog should not cancel while worker is alive"
+            "watchdog should not cancel while worker is alive"
         );
 
         // Clean up.

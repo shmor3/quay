@@ -22,13 +22,14 @@
 //! The lock is held only for short in-memory operations so contention is
 //! negligible in practice.
 
-use similar::{ChangeTag, TextDiff};
+use parking_lot::Mutex;
+use prometheus::IntGauge;
+use similar::TextDiff;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, warn};
-use prometheus::IntGauge;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -142,7 +143,12 @@ impl DiffStore {
         let capacity = capacity.max(1);
         let max_keys = max_keys.max(1);
         let max_file_size = max_file_size.max(1);
-        let diff_gauge = IntGauge::new("quay_diff_count", "Total diffs in store").unwrap();
+        let diff_gauge =
+            IntGauge::new("quay_diff_count", "Total diffs in store").unwrap_or_else(|e| {
+                warn!("Failed to create metric: {}", e);
+                IntGauge::new("fallback_diff", "fallback")
+                    .expect("fallback metric creation should never fail")
+            });
         Self {
             diffs: HashMap::new(),
             snapshots: HashMap::new(),
@@ -219,7 +225,8 @@ impl DiffStore {
 
         self.insert_entry(path, entry.clone());
 
-        self.diff_gauge.set(self.diffs.values().map(|v| v.len() as i64).sum());
+        self.diff_gauge
+            .set(self.diffs.values().map(|v| v.len() as i64).sum());
         Some(entry)
     }
 
@@ -236,8 +243,8 @@ impl DiffStore {
         // Fast-path: check file size via metadata before reading.
         match file_path.metadata() {
             Ok(meta) => {
-                let len = meta.len() as usize;
-                if len > self.max_file_size {
+                if meta.len() > self.max_file_size as u64 {
+                    let len = meta.len() as usize;
                     debug!(
                         path = %file_path.display(),
                         size = len,
@@ -280,6 +287,90 @@ impl DiffStore {
                 None
             }
         }
+    }
+
+    /// Convenience: record a change by reading the file from disk without holding the store lock
+    /// for the duration of the expensive diff computation.
+    pub fn record_change_from_disk_shared(
+        store_mutex: &SharedDiffStore,
+        normalized: &str,
+        file_path: &Path,
+    ) -> Option<DiffEntry> {
+        let max_file_size = store_mutex.lock().max_file_size;
+
+        // Fast-path: check file size via metadata before reading.
+        match file_path.metadata() {
+            Ok(meta) => {
+                if meta.len() > max_file_size as u64 {
+                    let len = meta.len() as usize;
+                    debug!(
+                        path = %file_path.display(),
+                        size = len,
+                        limit = max_file_size,
+                        "file exceeds max_file_size (pre-read check); recording placeholder"
+                    );
+                    let mut store = store_mutex.lock();
+                    let old_size = store.snapshots.get(normalized).map_or(0, Vec::len);
+                    let entry = DiffEntry {
+                        path: normalized.to_string(),
+                        timestamp: SystemTime::now(),
+                        diff: Self::too_large_placeholder(len, max_file_size),
+                        old_size,
+                        new_size: len,
+                        binary: false,
+                        truncated: true,
+                    };
+                    store.insert_entry(normalized, entry.clone());
+                    return Some(entry);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    path = %file_path.display(),
+                    error = %e,
+                    "failed to stat file for diff store; will attempt read anyway"
+                );
+            }
+        }
+
+        let content = match std::fs::read(file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    path = %file_path.display(),
+                    error = %e,
+                    "failed to read file for diff store"
+                );
+                return None;
+            }
+        };
+
+        let old_content = {
+            let store = store_mutex.lock();
+            store.snapshots.get(normalized).cloned()
+        };
+
+        let old_size = old_content.as_ref().map_or(0, Vec::len);
+        let (diff_text, binary) = compute_diff(normalized, old_content.as_deref(), &content);
+
+        let entry = DiffEntry {
+            path: normalized.to_string(),
+            timestamp: SystemTime::now(),
+            diff: diff_text,
+            old_size,
+            new_size: content.len(),
+            binary,
+            truncated: false,
+        };
+
+        let mut store = store_mutex.lock();
+        store.snapshots.insert(normalized.to_string(), content);
+        store.insert_entry(normalized, entry.clone());
+        store
+            .diff_gauge
+            .set(store.diffs.values().map(|v| v.len() as i64).sum());
+
+        Some(entry)
     }
 
     /// Seed the snapshot for a path *without* creating a diff entry.
@@ -1060,7 +1151,7 @@ mod tests {
     #[test]
     fn new_shared_creates_arc_mutex() {
         let shared = DiffStore::new_shared(5, 10, DEFAULT_MAX_FILE_SIZE);
-        let guard = shared.lock().unwrap();
+        let guard = shared.lock();
         assert_eq!(guard.capacity, 5);
         assert_eq!(guard.max_keys, 10);
         assert_eq!(guard.max_file_size, DEFAULT_MAX_FILE_SIZE);
@@ -1070,11 +1161,11 @@ mod tests {
     fn shared_store_usable_across_scopes() {
         let shared = DiffStore::new_shared(5, 10, DEFAULT_MAX_FILE_SIZE);
         {
-            let mut guard = shared.lock().unwrap();
+            let mut guard = shared.lock();
             guard.record_change("x.txt", b"hello\n");
         }
         {
-            let guard = shared.lock().unwrap();
+            let guard = shared.lock();
             assert!(guard.get_latest("x.txt").is_some());
         }
     }
@@ -1290,7 +1381,10 @@ mod tests {
 
         for line in entry.diff.lines() {
             assert!(
-                line.starts_with("+") || line.starts_with("-") || line.starts_with(" ") || line.starts_with("@"),
+                line.starts_with("+")
+                    || line.starts_with("-")
+                    || line.starts_with(" ")
+                    || line.starts_with("@"),
                 "unexpected line prefix: {:?}",
                 line
             );

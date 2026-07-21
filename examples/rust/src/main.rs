@@ -120,9 +120,8 @@ fn connect_and_listen(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 log("server sent close frame");
                 break;
             }
-            Message::Ping(data) => {
-                // Respond to pings to keep the connection alive.
-                socket.send(Message::Pong(data))?;
+            Message::Ping(_) => {
+                // tungstenite automatically replies to pings.
             }
             // Ignore binary, pong, and frame messages.
             _ => {}

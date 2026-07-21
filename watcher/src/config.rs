@@ -183,11 +183,11 @@ impl ConfigEntry {
 /// Invalid entries are logged and skipped rather than failing the entire parse.
 pub fn parse_configs(yaml: &str) -> Vec<ConfigEntry> {
     // Try as a sequence first, then as a single mapping.
-    if let Ok(raw_list) = serde_yaml::from_str::<Vec<RawConfig>>(yaml) {
+    if let Ok(raw_list) = serde_yml::from_str::<Vec<RawConfig>>(yaml) {
         return raw_list.into_iter().map(ConfigEntry::from).collect();
     }
 
-    if let Ok(raw) = serde_yaml::from_str::<RawConfig>(yaml) {
+    if let Ok(raw) = serde_yml::from_str::<RawConfig>(yaml) {
         return vec![ConfigEntry::from(raw)];
     }
 
@@ -427,12 +427,12 @@ ignore:
 
     #[test]
     fn yaml_with_utf8_bom() {
-        // UTF-8 BOM is \xEF\xBB\xBF — serde_yaml should handle it gracefully
+        // UTF-8 BOM is \xEF\xBB\xBF — serde_yml should handle it gracefully
         // or we should get an empty result, not a panic.
         let bom = "\u{FEFF}";
         let yaml = format!("{}name: bom\nwatch: \"**/*.rs\"\n", bom);
         let configs = parse_configs(&yaml);
-        // serde_yaml may or may not handle BOM; either parse succeeds or returns empty.
+        // serde_yml may or may not handle BOM; either parse succeeds or returns empty.
         // The key property is that it must not panic.
         if !configs.is_empty() {
             assert_eq!(configs.len(), 1);
@@ -958,5 +958,3 @@ another_extra: 42
         assert_eq!(result, "make 'evil;payload'");
     }
 }
-
-

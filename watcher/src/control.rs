@@ -69,6 +69,7 @@ const CONTROL_READ_MAX_BYTES: usize = 64 * 1024; // 64 KiB
 /// - `{"cmd": "diff", "path": "<path>"}` – return the latest diff for a file.
 /// - `{"cmd": "diffs"}` – list all tracked files with a summary.
 /// - `{"cmd": "diff-clear"}` – clear all entries from the diff store.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_control_server(
     listener: TcpListener,
     btx: broadcast::Sender<String>,
@@ -124,6 +125,7 @@ pub fn spawn_control_server(
 /// Reads one newline-terminated JSON command, processes it, writes a response,
 /// and closes the connection.  A 5-second read timeout prevents stalled clients
 /// from holding the socket open indefinitely.
+#[allow(clippy::too_many_arguments)]
 async fn handle_control_client(
     mut socket: tokio::net::TcpStream,
     btx: broadcast::Sender<String>,
@@ -159,9 +161,8 @@ async fn handle_control_client(
         Ok(Ok(_)) => {}
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
             debug!("control socket request exceeded size limit");
-            let _ = socket
-                .write_all(b"{\"error\":\"request too large\"}\n")
-                .await;
+            let msg = format!("{}\n", serde_json::json!({"error": "request too large"}));
+            let _ = socket.write_all(msg.as_bytes()).await;
             return;
         }
         Ok(Err(e)) => {
@@ -170,7 +171,8 @@ async fn handle_control_client(
         }
         Err(_) => {
             debug!("control socket read timed out");
-            let _ = socket.write_all(b"{\"error\":\"read timeout\"}\n").await;
+            let msg = format!("{}\n", serde_json::json!({"error": "read timeout"}));
+            let _ = socket.write_all(msg.as_bytes()).await;
             return;
         }
     }
@@ -188,11 +190,11 @@ async fn handle_control_client(
             Some("diff-clear") => handle_diff_clear_cmd(&diff_store),
             Some(other) => {
                 warn!(cmd = other, "unknown control command");
-                "{\"error\":\"unknown command\"}\n".to_string()
+                format!("{}\n", serde_json::json!({"error": "unknown command"}))
             }
-            None => "{\"error\":\"missing 'cmd' field\"}\n".to_string(),
+            None => format!("{}\n", serde_json::json!({"error": "missing 'cmd' field"})),
         },
-        Err(_) => "{\"error\":\"invalid json\"}\n".to_string(),
+        Err(_) => format!("{}\n", serde_json::json!({"error": "invalid json"})),
     };
 
     let _ = socket.write_all(response.as_bytes()).await;
@@ -208,29 +210,22 @@ async fn handle_control_client(
 fn handle_reload_cmd(btx: &broadcast::Sender<String>, statuses: &StatusMap) -> String {
     let _ = btx.send(serde_json::json!({"type": "reload"}).to_string());
 
-    if let Ok(mut guard) = statuses.lock() {
-        for value in guard.values_mut() {
-            *value = "up to date".to_string();
-        }
-    } else {
-        warn!("status map lock poisoned during reload; statuses not reset");
+    let mut guard = statuses.lock();
+    for value in guard.values_mut() {
+        *value = "up to date".to_string();
     }
 
-    "{\"status\":\"ok\"}\n".to_string()
+    format!("{}\n", serde_json::json!({"status": "ok"}))
 }
 
 /// Process a `status` command: serialise the current status map and include
 /// the active WebSocket connection count.
 fn handle_status_cmd(statuses: &StatusMap, connection_count: &Arc<AtomicUsize>) -> String {
-    let configs = if let Ok(guard) = statuses.lock() {
-        guard
-            .iter()
-            .map(|(name, status)| serde_json::json!({"name": name, "status": status}))
-            .collect::<Vec<_>>()
-    } else {
-        warn!("status map lock poisoned");
-        Vec::new()
-    };
+    let guard = statuses.lock();
+    let configs = guard
+        .iter()
+        .map(|(name, status)| serde_json::json!({"name": name, "status": status}))
+        .collect::<Vec<_>>();
 
     let connections = connection_count.load(Ordering::Relaxed);
 
@@ -245,21 +240,20 @@ fn handle_status_cmd(statuses: &StatusMap, connection_count: &Arc<AtomicUsize>) 
 fn handle_diff_cmd(diff_store: &Option<SharedDiffStore>, path: Option<&str>) -> String {
     let store = match diff_store {
         Some(s) => s,
-        None => return "{\"error\":\"diff store not enabled (start with --diff)\"}\n".to_string(),
+        None => {
+            return format!(
+                "{}\n",
+                serde_json::json!({"error": "diff store not enabled (start with --diff)"})
+            )
+        }
     };
 
     let path = match path {
         Some(p) => p,
-        None => return "{\"error\":\"missing 'path' field\"}\n".to_string(),
+        None => return format!("{}\n", serde_json::json!({"error": "missing 'path' field"})),
     };
 
-    let guard = match store.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            warn!("diff store lock poisoned");
-            return "{\"error\":\"internal error\"}\n".to_string();
-        }
-    };
+    let guard = store.lock();
 
     match guard.get_latest(path) {
         Some(entry) => {
@@ -277,16 +271,15 @@ fn handle_diff_cmd(diff_store: &Option<SharedDiffStore>, path: Option<&str>) -> 
 fn handle_diffs_cmd(diff_store: &Option<SharedDiffStore>) -> String {
     let store = match diff_store {
         Some(s) => s,
-        None => return "{\"error\":\"diff store not enabled (start with --diff)\"}\n".to_string(),
-    };
-
-    let guard = match store.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            warn!("diff store lock poisoned");
-            return "{\"error\":\"internal error\"}\n".to_string();
+        None => {
+            return format!(
+                "{}\n",
+                serde_json::json!({"error": "diff store not enabled (start with --diff)"})
+            )
         }
     };
+
+    let guard = store.lock();
 
     let summary = guard.summary();
     let keys: Vec<&str> = guard.list_keys();
@@ -317,32 +310,45 @@ fn handle_diffs_cmd(diff_store: &Option<SharedDiffStore>) -> String {
 fn handle_diff_clear_cmd(diff_store: &Option<SharedDiffStore>) -> String {
     let store = match diff_store {
         Some(s) => s,
-        None => return "{\"error\":\"diff store not enabled (start with --diff)\"}\n".to_string(),
+        None => {
+            return format!(
+                "{}\n",
+                serde_json::json!({"error": "diff store not enabled (start with --diff)"})
+            )
+        }
     };
 
-    match store.lock() {
-        Ok(mut guard) => {
-            guard.clear();
-            "{\"status\":\"ok\"}\n".to_string()
-        }
-        Err(_) => {
-            warn!("diff store lock poisoned");
-            "{\"error\":\"internal error\"}\n".to_string()
-        }
-    }
+    let mut guard = store.lock();
+    guard.clear();
+    format!("{}\n", serde_json::json!({"status": "ok"}))
 }
 
 // ---------------------------------------------------------------------------
 // Client helpers (used by `quay reload` / `quay status` / `quay diff`)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    #[error("failed to connect to control socket at {addr}: {source}")]
+    Connect {
+        addr: String,
+        source: std::io::Error,
+    },
+    #[error("failed to send request: {source}")]
+    Send { source: std::io::Error },
+    #[error("failed to read response: {0}")]
+    Read(std::io::Error),
+    #[error("timed out reading response after 10s")]
+    Timeout,
+}
+
 /// Send a reload request to the control socket and print the response.
-pub async fn send_reload(control_addr: &str) -> std::result::Result<(), String> {
+pub async fn send_reload(control_addr: &str) -> std::result::Result<(), ControlError> {
     send_control_command(control_addr, "reload").await
 }
 
 /// Send a status request to the control socket and print the response.
-pub async fn send_status(control_addr: &str) -> std::result::Result<(), String> {
+pub async fn send_status(control_addr: &str) -> std::result::Result<(), ControlError> {
     send_control_command(control_addr, "status").await
 }
 
@@ -350,10 +356,16 @@ pub async fn send_status(control_addr: &str) -> std::result::Result<(), String> 
 ///
 /// When `path` is `Some`, queries the latest diff for that file.
 /// When `path` is `None`, lists all tracked files with a summary.
-pub async fn send_diff(control_addr: &str, path: Option<&str>) -> std::result::Result<(), String> {
+pub async fn send_diff(
+    control_addr: &str,
+    path: Option<&str>,
+) -> std::result::Result<(), ControlError> {
     let mut stream = tokio::net::TcpStream::connect(control_addr)
         .await
-        .map_err(|e| format!("failed to connect to control socket at {control_addr}: {e}"))?;
+        .map_err(|e| ControlError::Connect {
+            addr: control_addr.to_string(),
+            source: e,
+        })?;
 
     let req = match path {
         Some(p) => serde_json::json!({"cmd": "diff", "path": p}).to_string() + "\n",
@@ -362,7 +374,7 @@ pub async fn send_diff(control_addr: &str, path: Option<&str>) -> std::result::R
     stream
         .write_all(req.as_bytes())
         .await
-        .map_err(|e| format!("failed to send diff request: {e}"))?;
+        .map_err(|e| ControlError::Send { source: e })?;
 
     let mut buf = Vec::new();
     match tokio::time::timeout(
@@ -374,9 +386,11 @@ pub async fn send_diff(control_addr: &str, path: Option<&str>) -> std::result::R
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             eprintln!("warning: error reading response: {e}");
+            return Err(ControlError::Read(e));
         }
         Err(_) => {
             eprintln!("warning: timed out reading response after 10s");
+            return Err(ControlError::Timeout);
         }
     }
     println!("{}", String::from_utf8_lossy(&buf));
@@ -385,16 +399,20 @@ pub async fn send_diff(control_addr: &str, path: Option<&str>) -> std::result::R
 }
 
 /// Generic helper: connect, send a JSON command, read the full response, print it.
-async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), String> {
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("failed to connect to control socket at {addr}: {e}"))?;
+async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), ControlError> {
+    let mut stream =
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| ControlError::Connect {
+                addr: addr.to_string(),
+                source: e,
+            })?;
 
     let req = serde_json::json!({"cmd": cmd}).to_string() + "\n";
     stream
         .write_all(req.as_bytes())
         .await
-        .map_err(|e| format!("failed to send {cmd} request: {e}"))?;
+        .map_err(|e| ControlError::Send { source: e })?;
 
     let mut buf = Vec::new();
     match tokio::time::timeout(
@@ -406,9 +424,11 @@ async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), 
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             eprintln!("warning: error reading response: {e}");
+            return Err(ControlError::Read(e));
         }
         Err(_) => {
             eprintln!("warning: timed out reading response after 10s");
+            return Err(ControlError::Timeout);
         }
     }
     println!("{}", String::from_utf8_lossy(&buf));
@@ -440,7 +460,7 @@ mod tests {
         let response = handle_reload_cmd(&btx, &statuses);
         assert!(response.contains("\"ok\""));
 
-        let guard = statuses.lock().unwrap();
+        let guard = statuses.lock();
         assert_eq!(guard.get("a").unwrap(), "up to date");
     }
 
@@ -454,7 +474,7 @@ mod tests {
 
         handle_reload_cmd(&btx, &statuses);
 
-        let guard = statuses.lock().unwrap();
+        let guard = statuses.lock();
         for val in guard.values() {
             assert_eq!(val, "up to date");
         }
@@ -613,7 +633,7 @@ mod tests {
     fn handle_diff_cmd_returns_latest_diff() {
         let store = DiffStore::new_shared(5, 10, 1024);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("a.css", b"old\n");
             guard.record_change("a.css", b"new\n");
         }
@@ -629,7 +649,7 @@ mod tests {
     fn handle_diff_cmd_truncated_file() {
         let store = DiffStore::new_shared(5, 10, 8);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("big.txt", &[b'X'; 20]);
         }
         let resp = handle_diff_cmd(&Some(store), Some("big.txt"));
@@ -662,7 +682,7 @@ mod tests {
     fn handle_diffs_cmd_with_entries() {
         let store = DiffStore::new_shared(5, 10, 1024);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("a.txt", b"a\n");
             guard.record_change("b.txt", b"b\n");
         }
@@ -695,14 +715,14 @@ mod tests {
     fn handle_diff_clear_cmd_clears_store() {
         let store = DiffStore::new_shared(5, 10, 1024);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("a.txt", b"a");
             guard.record_change("b.txt", b"b");
         }
         let resp = handle_diff_clear_cmd(&Some(store.clone()));
         assert!(resp.contains("ok"));
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert!(guard.list_keys().is_empty());
     }
 
@@ -782,7 +802,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_status_command() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         let response = control_send(&addr, "{\"cmd\":\"status\"}\n").await;
         let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
@@ -795,7 +816,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_reload_command() {
-        let (addr, _btx, statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         set_status(&statuses, "test-cfg", "building");
 
@@ -804,7 +826,7 @@ mod tests {
         assert_eq!(parsed["status"], "ok");
 
         // Status should have been reset.
-        let guard = statuses.lock().unwrap();
+        let guard = statuses.lock();
         assert_eq!(guard.get("test-cfg").unwrap(), "up to date");
 
         cancel.cancel();
@@ -812,7 +834,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_reload_broadcasts_message() {
-        let (addr, btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
         let mut brx = btx.subscribe();
 
         control_send(&addr, "{\"cmd\":\"reload\"}\n").await;
@@ -826,7 +849,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_unknown_command() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         let response = control_send(&addr, "{\"cmd\":\"restart\"}\n").await;
         let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
@@ -838,7 +862,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_missing_cmd_field() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         let response = control_send(&addr, "{\"foo\":\"bar\"}\n").await;
         let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
@@ -850,7 +875,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_invalid_json() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         let response = control_send(&addr, "this is not json\n").await;
         let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
@@ -862,7 +888,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_empty_json_object() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         let response = control_send(&addr, "{}\n").await;
         let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
@@ -873,7 +900,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_multiple_sequential_connections() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         // Multiple sequential requests should each succeed.
         for _ in 0..5 {
@@ -887,7 +915,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_diff_command_store_disabled() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
         let resp = control_send(&addr, "{\"cmd\":\"diff\",\"path\":\"x.txt\"}\n").await;
         assert!(resp.contains("not enabled"));
         cancel.cancel();
@@ -897,11 +926,11 @@ mod tests {
     async fn control_socket_diff_command_returns_diff() {
         let store = DiffStore::new_shared(5, 10, 1024);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("f.css", b"old\n");
             guard.record_change("f.css", b"new\n");
         }
-        let (addr, _btx, _statuses, cancel, _counter) =
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
             setup_control_server_with_diff(Some(store)).await;
         let resp = control_send(&addr, "{\"cmd\":\"diff\",\"path\":\"f.css\"}\n").await;
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
@@ -915,10 +944,10 @@ mod tests {
     async fn control_socket_diffs_command_returns_summary() {
         let store = DiffStore::new_shared(5, 10, 1024);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("a.txt", b"a\n");
         }
-        let (addr, _btx, _statuses, cancel, _counter) =
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
             setup_control_server_with_diff(Some(store)).await;
         let resp = control_send(&addr, "{\"cmd\":\"diffs\"}\n").await;
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
@@ -931,22 +960,23 @@ mod tests {
     async fn control_socket_diff_clear_command() {
         let store = DiffStore::new_shared(5, 10, 1024);
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock();
             guard.record_change("a.txt", b"a");
         }
-        let (addr, _btx, _statuses, cancel, _counter) =
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
             setup_control_server_with_diff(Some(store.clone())).await;
         let resp = control_send(&addr, "{\"cmd\":\"diff-clear\"}\n").await;
         assert!(resp.contains("ok"));
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert!(guard.list_keys().is_empty());
         cancel.cancel();
     }
 
     #[tokio::test]
     async fn control_server_cancellation() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         // Verify server is running.
         let response = control_send(&addr, "{\"cmd\":\"status\"}\n").await;
@@ -959,7 +989,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_concurrent_requests() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         // Fire multiple requests concurrently.
         let mut handles = Vec::new();
@@ -991,7 +1022,15 @@ mod tests {
         let cancel = CancellationToken::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        spawn_ws_server(ws_listener, btx.clone(), cancel.clone(), counter.clone(), None, None, None);
+        spawn_ws_server(
+            ws_listener,
+            btx.clone(),
+            cancel.clone(),
+            counter.clone(),
+            None,
+            None,
+            None,
+        );
         spawn_control_server(
             ctrl_listener,
             btx.clone(),
@@ -1052,7 +1091,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_rejects_oversized_request() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         // Send a request that exceeds CONTROL_READ_MAX_BYTES (64 KiB) without
         // a newline terminator.  The server should reject it rather than OOM.
@@ -1109,7 +1149,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_accepts_request_under_limit() {
-        let (addr, _btx, _statuses, cancel, _counter) = setup_control_server().await;
+        let (addr, _btx, _statuses, cancel, _counter): (String, _, _, _, _) =
+            setup_control_server().await;
 
         // A normal-sized request should still work fine.
         let response = control_send(&addr, "{\"cmd\":\"status\"}\n").await;
@@ -1119,4 +1160,3 @@ mod tests {
         cancel.cancel();
     }
 }
-

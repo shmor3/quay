@@ -2675,7 +2675,7 @@
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = dir.join("quay.yaml");
 
-        // UTF-8 BOM + valid YAML.  serde_yaml may or may not handle the BOM
+        // UTF-8 BOM + valid YAML.  serde_yml may or may not handle the BOM
         // gracefully — the key property is that it must not panic.
         let yaml = "\u{FEFF}- name: bom\n  watch: \"**/*.rs\"\n";
         std::fs::write(&cfg_path, yaml).unwrap();

@@ -185,7 +185,15 @@ class HotReloadClient extends EventEmitter {
    */
   _writeCSSFile(filePath, css) {
     try {
-      const outPath = path.join(this.cssOutputDir, path.basename(filePath));
+      const outDir = path.resolve(this.cssOutputDir);
+      const outPath = path.resolve(outDir, filePath);
+      
+      // Ensure we don't write outside the output directory (Path Traversal protection)
+      if (!outPath.startsWith(outDir)) {
+        this._warn(`ignoring file outside output directory: ${filePath}`);
+        return;
+      }
+
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, css, "utf-8");
       this._log(`wrote CSS to ${outPath}`);

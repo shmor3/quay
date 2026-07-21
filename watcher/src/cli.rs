@@ -1,6 +1,6 @@
 //! Command-line argument definitions for the `quay` binary.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand as ClapSubcommand};
 use std::path::PathBuf;
 
 /// A minimal, language-agnostic file watcher that runs commands on changes
@@ -86,23 +86,32 @@ pub struct Args {
 
     /// Optional subcommand: `reload`, `status`, or `diff` (if omitted, run the watcher server).
     #[command(subcommand)]
-    pub subcmd: Option<SubCommand>,
+    pub subcmd: Option<Subcommand>,
 }
 
 /// Client-mode subcommands that contact the running quay control socket.
-#[derive(Subcommand, Debug, Clone)]
-pub enum SubCommand {
+#[derive(ClapSubcommand, Debug, Clone)]
+pub enum Subcommand {
     /// Force a reload: run configured build/on_change commands and broadcast a reload message to all browser clients.
-    #[command(about = "Force a reload: run configured build/on_change commands and broadcast a reload message to all browser clients.")]
+    #[command(
+        about = "Force a reload: run configured build/on_change commands and broadcast a reload message to all browser clients."
+    )]
     Reload,
     /// Query status of loaded configs and active WebSocket connections from the running quay instance.
-    #[command(about = "Query status of loaded configs and active WebSocket connections from the running quay instance.")]
+    #[command(
+        about = "Query status of loaded configs and active WebSocket connections from the running quay instance."
+    )]
     Status,
     /// Query stored file diffs from the running quay instance. Shows the latest diff for a specific file, or lists all tracked files.
-    #[command(about = "Query stored file diffs from the running quay instance. Shows the latest diff for a specific file, or lists all tracked files.")]
+    #[command(
+        about = "Query stored file diffs from the running quay instance. Shows the latest diff for a specific file, or lists all tracked files."
+    )]
     Diff {
         /// File path to show the diff for. When omitted, lists all tracked files with a summary.
-        #[arg(long = "path", help = "File path to show the diff for. When omitted, lists all tracked files with a summary.")]
+        #[arg(
+            long = "path",
+            help = "File path to show the diff for. When omitted, lists all tracked files with a summary."
+        )]
         path: Option<String>,
     },
 }
@@ -253,26 +262,26 @@ mod tests {
     #[test]
     fn reload_subcommand() {
         let args = parse(&["reload"]);
-        assert!(matches!(args.subcmd, Some(SubCommand::Reload)));
+        assert!(matches!(args.subcmd, Some(Subcommand::Reload)));
     }
 
     #[test]
     fn status_subcommand() {
         let args = parse(&["status"]);
-        assert!(matches!(args.subcmd, Some(SubCommand::Status)));
+        assert!(matches!(args.subcmd, Some(Subcommand::Status)));
     }
 
     #[test]
     fn diff_subcommand_no_path() {
         let args = parse(&["diff"]);
-        assert!(matches!(args.subcmd, Some(SubCommand::Diff { path: None })));
+        assert!(matches!(args.subcmd, Some(Subcommand::Diff { path: None })));
     }
 
     #[test]
     fn diff_subcommand_with_path() {
         let args = parse(&["diff", "--path", "src/main.css"]);
         match &args.subcmd {
-            Some(SubCommand::Diff { path }) => {
+            Some(Subcommand::Diff { path }) => {
                 assert_eq!(path.as_deref(), Some("src/main.css"));
             }
             other => panic!("expected Diff subcommand, got {:?}", other),
@@ -283,21 +292,21 @@ mod tests {
     fn subcommand_with_port() {
         let args = parse(&["--port", "4000", "reload"]);
         assert_eq!(args.port, 4000);
-        assert!(matches!(args.subcmd, Some(SubCommand::Reload)));
+        assert!(matches!(args.subcmd, Some(Subcommand::Reload)));
     }
 
     #[test]
     fn diff_subcommand_with_port() {
         let args = parse(&["--port", "4000", "diff", "--path", "x.css"]);
         assert_eq!(args.port, 4000);
-        assert!(matches!(args.subcmd, Some(SubCommand::Diff { .. })));
+        assert!(matches!(args.subcmd, Some(Subcommand::Diff { .. })));
     }
 
     #[test]
     fn subcommand_with_bind() {
         let args = parse(&["--bind", "0.0.0.0", "status"]);
         assert_eq!(args.bind_addr, "0.0.0.0");
-        assert!(matches!(args.subcmd, Some(SubCommand::Status)));
+        assert!(matches!(args.subcmd, Some(Subcommand::Status)));
     }
 
     // -- Combined flags ----------------------------------------------------
@@ -390,7 +399,7 @@ mod tests {
 
     #[test]
     fn subcommand_implements_debug_and_clone() {
-        let sub = SubCommand::Reload;
+        let sub = Subcommand::Reload;
         let dbg = format!("{:?}", sub);
         assert!(dbg.contains("Reload"));
 
@@ -401,7 +410,7 @@ mod tests {
 
     #[test]
     fn subcommand_status_debug_and_clone() {
-        let sub = SubCommand::Status;
+        let sub = Subcommand::Status;
         let dbg = format!("{:?}", sub);
         assert!(dbg.contains("Status"));
 
@@ -411,7 +420,7 @@ mod tests {
 
     #[test]
     fn subcommand_diff_debug_and_clone() {
-        let sub = SubCommand::Diff {
+        let sub = Subcommand::Diff {
             path: Some("test.css".to_string()),
         };
         let dbg = format!("{:?}", sub);

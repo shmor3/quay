@@ -59,7 +59,9 @@ pub fn validate_bind_addr(addr: &str, expose_network: bool) -> Result<(), String
     // Warn (but allow) binding to all interfaces — this exposes the server
     // to the local network which may not be intended.
     if (addr == "0.0.0.0" || addr == "::") && !expose_network {
-        return Err("binding to all interfaces is not allowed unless expose_network=true".to_string());
+        return Err(
+            "binding to all interfaces is not allowed unless expose_network=true".to_string(),
+        );
     } else if addr == "0.0.0.0" || addr == "::" {
         warn!(
             addr,
@@ -217,7 +219,7 @@ pub fn validate_diff_flags(diff_enabled: bool, diff_max_file_size: usize) {
 }
 
 #[allow(dead_code)]
-pub fn validate_auth_token(token: &Option<String>) -> Result<(), String> {
+pub fn validate_auth_token(token: Option<&str>) -> Result<(), String> {
     if token.is_none() {
         return Err("auth_token is required for secure operation".to_string());
     }
@@ -225,7 +227,7 @@ pub fn validate_auth_token(token: &Option<String>) -> Result<(), String> {
 }
 
 #[allow(dead_code)]
-pub fn validate_tls(cert: &Option<String>, key: &Option<String>) -> Result<(), String> {
+pub fn validate_tls(cert: Option<&str>, key: Option<&str>) -> Result<(), String> {
     if cert.is_none() || key.is_none() {
         return Err("TLS certificate and key are required for secure operation".to_string());
     }

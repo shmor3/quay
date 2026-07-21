@@ -182,7 +182,10 @@ func onInjectCSS(path, encodedContent string) {
 	log.Printf("CSS update for %s (%d bytes)", path, len(css))
 
 	// Example: write the CSS to the corresponding output file
-	// if err := os.WriteFile(path, css, 0644); err != nil {
+	// NOTE: Sanitize 'path' using filepath.Clean and verify it stays within your output directory
+	//       to prevent directory traversal attacks.
+	// outPath := filepath.Join("public", filepath.Clean("/"+path))
+	// if err := os.WriteFile(outPath, css, 0644); err != nil {
 	//     log.Printf("failed to write %s: %v", path, err)
 	// }
 

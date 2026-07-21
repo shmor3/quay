@@ -81,7 +81,12 @@ pub fn shell_escape(s: &str) -> String {
 /// Errors are logged but do **not** propagate — a failing build command should
 /// not crash the watcher.  Non-zero exit codes are logged at `warn` level;
 /// spawn/wait failures are logged at `error` level.
-pub fn run_command_blocking(cmd: &str, timeout: Option<Duration>, _max_memory_mb: Option<u32>, _max_cpu_seconds: Option<u32>) {
+pub fn run_command_blocking(
+    cmd: &str,
+    timeout: Option<Duration>,
+    _max_memory_mb: Option<u32>,
+    _max_cpu_seconds: Option<u32>,
+) {
     let result = {
         #[cfg(target_os = "windows")]
         {
@@ -308,7 +313,12 @@ mod tests {
         // We use a generous threshold so CI doesn't flake.
         let start = Instant::now();
         #[cfg(target_os = "windows")]
-        run_command_blocking("ping -n 10 127.0.0.1", Some(Duration::from_millis(500)), None, None);
+        run_command_blocking(
+            "ping -n 10 127.0.0.1",
+            Some(Duration::from_millis(500)),
+            None,
+            None,
+        );
         #[cfg(not(target_os = "windows"))]
         run_command_blocking("sleep 10", Some(Duration::from_millis(500)), None, None);
         let elapsed = start.elapsed();
@@ -376,7 +386,12 @@ mod tests {
     fn run_command_blocking_timeout_near_boundary() {
         let start = Instant::now();
         #[cfg(target_os = "windows")]
-        run_command_blocking("ping -n 100 127.0.0.1", Some(Duration::from_millis(200)), None, None);
+        run_command_blocking(
+            "ping -n 100 127.0.0.1",
+            Some(Duration::from_millis(200)),
+            None,
+            None,
+        );
         #[cfg(not(target_os = "windows"))]
         run_command_blocking("sleep 100", Some(Duration::from_millis(200)), None, None);
         let elapsed = start.elapsed();

@@ -299,7 +299,12 @@
 
       function b64decode(str) {
         try {
-          return atob(str);
+          var binString = atob(str);
+          var bytes = new Uint8Array(binString.length);
+          for (var i = 0; i < binString.length; i++) {
+            bytes[i] = binString.charCodeAt(i);
+          }
+          return new TextDecoder().decode(bytes);
         } catch (e) {
           return "";
         }
@@ -332,8 +337,15 @@
         for (var i = 0; i < links.length; i++) {
           var href = links[i].getAttribute("href");
           if (href && href.indexOf(path) !== -1) {
-            var base = href.split("?")[0];
-            links[i].setAttribute("href", base + "?_hr=" + Date.now());
+            try {
+              var url = new URL(href, location.href);
+              url.searchParams.set("_hr", Date.now());
+              links[i].setAttribute("href", url.href);
+            } catch (e) {
+              var cleanHref = href.replace(/([?&])_hr=\d+/, '');
+              var separator = cleanHref.indexOf("?") === -1 ? "?" : "&";
+              links[i].setAttribute("href", cleanHref + separator + "_hr=" + Date.now());
+            }
           }
         }
       }

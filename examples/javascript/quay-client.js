@@ -75,11 +75,17 @@
 
   /**
    * Decode a base64 string to its original text content.
+   * Uses TextDecoder to properly handle UTF-8 characters.
    * Falls back gracefully if decoding fails.
    */
   function b64decode(str) {
     try {
-      return atob(str);
+      var binString = atob(str);
+      var bytes = new Uint8Array(binString.length);
+      for (var i = 0; i < binString.length; i++) {
+        bytes[i] = binString.charCodeAt(i);
+      }
+      return new TextDecoder().decode(bytes);
     } catch (e) {
       warn("failed to decode base64 content: " + e);
       return "";
@@ -128,12 +134,18 @@
     for (var i = 0; i < links.length; i++) {
       var href = links[i].getAttribute("href");
       if (href && href.indexOf(path) !== -1) {
-        var separator = href.indexOf("?") === -1 ? "?" : "&";
-        links[i].setAttribute(
-          "href",
-          href.split("?")[0] + separator + "_hr=" + Date.now()
-        );
-        log("cache-busted linked stylesheet: " + href);
+        try {
+          var url = new URL(href, location.href);
+          url.searchParams.set("_hr", Date.now());
+          links[i].setAttribute("href", url.href);
+          log("cache-busted linked stylesheet: " + href);
+        } catch (e) {
+          // Fallback if URL constructor fails
+          var separator = href.indexOf("?") === -1 ? "?" : "&";
+          var cleanHref = href.replace(/([?&])_hr=\d+/, '');
+          separator = cleanHref.indexOf("?") === -1 ? "?" : "&";
+          links[i].setAttribute("href", cleanHref + separator + "_hr=" + Date.now());
+        }
       }
     }
   }

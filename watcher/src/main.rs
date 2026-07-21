@@ -38,6 +38,7 @@ mod validate;
 mod watcher;
 
 use clap::Parser;
+use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use std::fs;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -45,8 +46,6 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use prometheus::{Encoder, TextEncoder, Registry, IntGauge, IntCounter};
-use std::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -61,11 +60,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Prometheus metrics setup
     let registry = Registry::new();
-    let health_gauge = IntGauge::new("quay_health", "Health status of quay").unwrap();
-    let reload_counter = IntCounter::new("quay_reload_count", "Reload events").unwrap();
-    registry.register(Box::new(health_gauge.clone())).unwrap();
-    registry.register(Box::new(reload_counter.clone())).unwrap();
-    let registry = Arc::new(Mutex::new(registry));
+    let health_gauge = IntGauge::new("quay_health", "Health status of quay")
+        .expect("failed to create health gauge");
+    let reload_counter = IntCounter::new("quay_reload_count", "Reload events")
+        .expect("failed to create reload counter");
+    registry
+        .register(Box::new(health_gauge.clone()))
+        .expect("failed to register health gauge");
+    registry
+        .register(Box::new(reload_counter.clone()))
+        .expect("failed to register reload counter");
 
     let args = cli::Args::parse();
     let cmd_template = args.cmd_template.clone();
@@ -119,19 +123,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // -----------------------------------------------------------------------
     if let Some(sub) = &args.subcmd {
         match sub {
-            cli::SubCommand::Reload => {
+            cli::Subcommand::Reload => {
                 if let Err(e) = control::send_reload(&control_addr).await {
                     error!("{e}");
                     std::process::exit(1);
                 }
             }
-            cli::SubCommand::Status => {
+            cli::Subcommand::Status => {
                 if let Err(e) = control::send_status(&control_addr).await {
                     error!("{e}");
                     std::process::exit(1);
                 }
             }
-            cli::SubCommand::Diff { path } => {
+            cli::Subcommand::Diff { path } => {
                 if let Err(e) = control::send_diff(&control_addr, path.as_deref()).await {
                     error!("{e}");
                     std::process::exit(1);
@@ -160,7 +164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         // Canonicalize to an absolute path so that notify event paths and our
         // internal comparisons (e.g. config hot-reload) are consistent.
-        raw.canonicalize().unwrap_or_else(|_| raw.clone())
+        match raw.canonicalize() {
+            Ok(path) => path,
+            Err(e) => {
+                error!(path = %raw.display(), error = %e, "failed to canonicalize watch path");
+                std::process::exit(1);
+            }
+        }
     };
 
     // Cancellation token for coordinated graceful shutdown.
@@ -188,9 +198,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 configs = parsed;
             }
             Err(e) => {
-    warn!(path = %cfg_path.display(), error = %e, "failed to read config file");
-    eprintln!("Actionable guidance: Could not read quay.yaml. Please check file permissions and YAML syntax.");
-}
+                warn!(path = %cfg_path.display(), error = %e, "failed to read config file");
+                eprintln!("Actionable guidance: Could not read quay.yaml. Please check file permissions and YAML syntax.");
+            }
         }
     } else {
         info!(
@@ -232,7 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|e| error::WatchdError::Bind {
             addr: ws_addr.clone(),
             source: e,
-            user_message: Some("Failed to bind WebSocket server. Check address and port.".to_string()),
+            user_message: Some(
+                "Failed to bind WebSocket server. Check address and port.".to_string(),
+            ),
         })?;
     info!(addr = %ws_addr, "WebSocket server listening");
 
@@ -280,25 +292,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let registry_clone = registry.clone();
     tokio::spawn(async move {
         let health_addr = "127.0.0.1:9090";
-        let listener = TcpListener::bind(health_addr).await.unwrap();
+        let listener = match TcpListener::bind(health_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(addr = %health_addr, error = %e, "failed to bind health endpoint; running without it");
+                return;
+            }
+        };
         info!(addr = %health_addr, "health endpoint listening");
         loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "health endpoint accept failed");
+                    continue;
+                }
+            };
             let mut buffer = Vec::new();
             let encoder = TextEncoder::new();
-            {
-                let registry = registry_clone.lock().unwrap();
-                let mf = registry.gather();
-                encoder.encode(&mf, &mut buffer).unwrap();
+            let mf = registry_clone.gather();
+            if let Err(e) = encoder.encode(&mf, &mut buffer) {
+                warn!(error = %e, "failed to encode prometheus metrics");
+                continue;
             }
             use tokio::io::AsyncWriteExt;
-            let _ = socket.write_all(&buffer).await;
+            if let Err(e) = socket.write_all(&buffer).await {
+                warn!(error = %e, "failed to write to health endpoint socket");
+            }
         }
     });
 
     // Start the file-system watcher and blocking event worker.
     // We keep `_watcher` alive so that `notify` continues delivering events.
-    // The `worker_handle` is monitored by the health quayog.
+    // The `worker_handle` is monitored by the health watchdog.
     let (_watcher, worker_handle) = watcher::start(watcher::WatcherParams {
         watch_root: watch_root.into_boxed_path(),
         cmd_template,
@@ -314,18 +340,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         diff_store,
     })?;
 
-    // Spawn the worker health quayog.  If the worker thread terminates
-    // unexpectedly (panic, channel closure), the quayog triggers a
+    // Spawn the worker health watchdog.  If the worker thread terminates
+    // unexpectedly (panic, channel closure), the watchdog triggers a
     // coordinated shutdown so the server doesn't run in a degraded state.
-    let _quayog = health::WorkerWatchdog::new(worker_handle, cancel.clone()).spawn();
+    let _watchdog = health::WorkerWatchdog::new(worker_handle, cancel.clone()).spawn();
 
     // Wait for Ctrl-C to initiate graceful shutdown.
     match tokio::signal::ctrl_c().await {
         Ok(()) => info!("received Ctrl-C; shutting down"),
         Err(e) => {
-    error!(error = %e, "failed to listen for Ctrl-C");
-    eprintln!("Actionable guidance: Unable to listen for Ctrl-C. Try running with proper terminal permissions.");
-}
+            error!(error = %e, "failed to listen for Ctrl-C");
+            eprintln!("Actionable guidance: Unable to listen for Ctrl-C. Try running with proper terminal permissions.");
+        }
     }
 
     // Signal all tasks to stop.

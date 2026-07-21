@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -92,26 +92,24 @@ pub fn track_connect(counter: &Arc<AtomicUsize>) -> usize {
 /// Uses a compare-and-swap loop to avoid wrapping past zero — if the counter
 /// is already `0` it stays at `0` instead of wrapping to `usize::MAX`.
 pub fn track_disconnect(counter: &Arc<AtomicUsize>) -> usize {
-    loop {
-        let current = counter.load(Ordering::Relaxed);
-        if current == 0 {
+    match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        if c == 0 {
+            None
+        } else {
+            Some(c - 1)
+        }
+    }) {
+        Ok(prev) => {
+            let new_val = prev - 1;
+            debug!(connections = new_val, "WebSocket client disconnected");
+            new_val
+        }
+        Err(_) => {
             debug!(
                 connections = 0,
                 "WebSocket client disconnected (counter already at zero)"
             );
-            return 0;
-        }
-        let new_val = current - 1;
-        match counter.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            Ok(_) => {
-                debug!(connections = new_val, "WebSocket client disconnected");
-                return new_val;
-            }
-            Err(_) => {
-                // Another thread changed the counter; retry.
-                continue;
-            }
+            0
         }
     }
 }
@@ -151,15 +149,15 @@ fn is_relevant_event(kind: &EventKind) -> bool {
 // Command execution
 // ---------------------------------------------------------------------------
 
-/// Run a shell command synchronously (blocking the current thread).
-///
-/// On Windows the command is executed via `cmd /C`; on Unix via `sh -c`.
-///
-/// When `timeout` is `Some`, the child process is killed if it has not
-/// completed within the given duration.
-///
-/// Errors are logged but do not propagate — a failing build command should not
-/// crash the watcher.
+// Run a shell command synchronously (blocking the current thread).
+//
+// On Windows the command is executed via `cmd /C`; on Unix via `sh -c`.
+//
+// When `timeout` is `Some`, the child process is killed if it has not
+// completed within the given duration.
+//
+// Errors are logged but do not propagate — a failing build command should not
+// crash the watcher.
 // Note: `run_command_blocking` and `shell_escape` are imported from
 // `crate::command`.  `Debouncer` is imported from `crate::debounce`.
 // These were previously defined inline in this module but have been
@@ -291,7 +289,7 @@ fn try_reload_configs(config_path: &Path) -> Option<Vec<ConfigEntry>> {
 /// debouncer, and optional diff store.  It is constructed by [`start`] and
 /// moved into a dedicated OS thread.
 struct WorkerContext {
-    rx: std_mpsc::Receiver<NotifyResult<Event>>,
+    rx: std_mpsc::Receiver<(NotifyResult<Event>, Instant)>,
     btx: broadcast::Sender<String>,
     filter: PathFilter,
     configs: Vec<ConfigEntry>,
@@ -303,69 +301,79 @@ struct WorkerContext {
     config_path: Box<Path>,
     /// Optional diff store for recording file change diffs.
     diff_store: Option<SharedDiffStore>,
+    cancel: CancellationToken,
 }
 
 impl WorkerContext {
-    /// Main event loop — runs until the channel is closed.
-    ///
-    /// Each incoming event is wrapped in [`panic::catch_unwind`] so that a bug
-    /// in a single event handler (e.g. a malformed path triggering an
-    /// unexpected panic) does not kill the entire worker thread.  The worker
-    /// continues processing subsequent events after logging the panic.
-    ///
-    /// Statistics (total events received, events processed, errors, panics)
-    /// are logged on exit for post-mortem observability.
     fn run(mut self) {
         let mut total_received: u64 = 0;
         let mut total_processed: u64 = 0;
         let mut total_errors: u64 = 0;
         let mut total_panics: u64 = 0;
 
-        while let Ok(result) = self.rx.recv() {
-            total_received += 1;
+        loop {
+            if self.cancel.is_cancelled() {
+                info!("cancellation requested; worker exiting");
+                break;
+            }
 
-            match result {
-                Ok(event) => {
-                    // Skip events that don't represent actual data changes.
-                    if !is_relevant_event(&event.kind) {
-                        continue;
-                    }
+            let timeout = self
+                .debouncer
+                .next_timeout()
+                .unwrap_or(Duration::from_millis(50));
+            let recv_res = self.rx.recv_timeout(timeout);
 
-                    for path in event.paths.iter() {
-                        // Catch panics so that one bad path doesn't kill the
-                        // worker.  We use AssertUnwindSafe because our mutable
-                        // borrow cannot cross the unwind boundary without it,
-                        // and we accept the (tiny) risk that internal state is
-                        // left slightly inconsistent — the debouncer and
-                        // status map are tolerant of this.
-                        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                            self.handle_path(path);
-                        }));
-                        match result {
-                            Ok(()) => {
-                                total_processed += 1;
+            match recv_res {
+                Ok((result, event_time)) => {
+                    total_received += 1;
+
+                    match result {
+                        Ok(event) => {
+                            if !is_relevant_event(&event.kind) {
+                                continue;
                             }
-                            Err(payload) => {
-                                total_panics += 1;
-                                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                                    (*s).to_string()
-                                } else if let Some(s) = payload.downcast_ref::<String>() {
-                                    s.clone()
-                                } else {
-                                    "unknown panic payload".to_string()
-                                };
-                                error!(
-                                    path = %path.display(),
-                                    panic = %msg,
-                                    "worker panic caught while handling event; continuing"
-                                );
+
+                            for path in event.paths.iter() {
+                                let raw = path.to_string_lossy().to_string();
+                                self.debouncer.add_event(raw, event_time);
                             }
+                        }
+                        Err(e) => {
+                            total_errors += 1;
+                            warn!(error = %e, "file watcher reported an error");
                         }
                     }
                 }
-                Err(e) => {
-                    total_errors += 1;
-                    warn!(error = %e, "file watcher reported an error");
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+
+            for path in self.debouncer.drain_ready() {
+                let p = std::path::PathBuf::from(path);
+                let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    self.handle_path(&p);
+                }));
+                match result {
+                    Ok(()) => {
+                        total_processed += 1;
+                    }
+                    Err(payload) => {
+                        total_panics += 1;
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        error!(
+                            path = %p.display(),
+                            panic = %msg,
+                            "worker panic caught while handling event; continuing"
+                        );
+                    }
                 }
             }
         }
@@ -381,12 +389,6 @@ impl WorkerContext {
 
     fn handle_path(&mut self, path: &Path) {
         let raw = path.to_string_lossy().to_string();
-
-        // Debounce: skip if we saw this path too recently.
-        if !self.debouncer.should_handle(&raw) {
-            return;
-        }
-
         let normalized = normalize_path(&raw);
 
         // Detect config file change → hot-reload.
@@ -394,11 +396,10 @@ impl WorkerContext {
             info!("quay.yaml changed; reloading configs");
             if let Some(new_configs) = try_reload_configs(&self.config_path) {
                 // Update the status map: remove old entries, add new ones.
-                if let Ok(mut guard) = self.statuses.lock() {
-                    guard.clear();
-                    for cfg in &new_configs {
-                        guard.insert(cfg.name.clone(), "up to date".to_string());
-                    }
+                let mut guard = self.statuses.lock();
+                guard.clear();
+                for cfg in &new_configs {
+                    guard.insert(cfg.name.clone(), "up to date".to_string());
                 }
                 self.configs = new_configs;
             }
@@ -412,12 +413,8 @@ impl WorkerContext {
         }
 
         // Record the diff in the KV store (if enabled).
-        // This is done *after* the filter check so that excluded paths
-        // (e.g. node_modules/, .git/, target/) are not recorded.
         if let Some(ref store) = self.diff_store {
-            if let Ok(mut guard) = store.lock() {
-                guard.record_change_from_disk(&normalized, path);
-            }
+            crate::kv::DiffStore::record_change_from_disk_shared(store, &normalized, path);
         }
 
         // Try each loaded config.
@@ -434,7 +431,11 @@ impl WorkerContext {
             // Run on_change / build command if configured.
             if let Some(cmd) = cfg.command_for(&normalized) {
                 info!(config = %cfg.name, cmd = %cmd, "running command");
-                run_command_blocking(&cmd, self.cmd_timeout, None, None);
+                let timeout = self.cmd_timeout;
+                let cmd_clone = cmd.clone();
+                tokio::task::spawn_blocking(move || {
+                    run_command_blocking(&cmd_clone, timeout, None, None);
+                });
             }
 
             // Notify browser clients.
@@ -466,12 +467,15 @@ impl WorkerContext {
         }
 
         // Generic fallback: run the configured command template and reload.
-        // Shell-escape the path to prevent command injection via crafted filenames.
         let cmd = self
             .cmd_template
             .replace("{path}", &shell_escape(&normalized));
         info!(cmd = %cmd, "running fallback command");
-        run_command_blocking(&cmd, self.cmd_timeout, None, None);
+        let timeout = self.cmd_timeout;
+        let cmd_clone = cmd.clone();
+        tokio::task::spawn_blocking(move || {
+            run_command_blocking(&cmd_clone, timeout, None, None);
+        });
         broadcast_reload(&self.btx, &normalized, "default");
     }
 }
@@ -506,7 +510,7 @@ pub fn start(
         configs,
         btx,
         statuses,
-        cancel: _cancel,
+        cancel,
         cmd_timeout_ms,
         connection_count: _connection_count,
         diff_store,
@@ -514,11 +518,11 @@ pub fn start(
 
     let cmd_timeout = cmd_timeout_ms.map(Duration::from_millis);
 
-    let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+    let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
 
     let mut watcher = RecommendedWatcher::new(
         move |res| {
-            let _ = tx.send(res);
+            let _ = tx.send((res, Instant::now()));
         },
         Config::default(),
     )?;
@@ -538,7 +542,7 @@ pub fn start(
     if !skip_initial_run {
         let cmd = cmd_template.clone();
         let timeout = cmd_timeout;
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
             info!(cmd = %cmd, "running startup command");
             run_command_blocking(&cmd, timeout, None, None);
         });
@@ -556,10 +560,15 @@ pub fn start(
         cmd_timeout,
         config_path,
         diff_store,
+        cancel,
     };
+    let handle = tokio::runtime::Handle::current();
     let worker_handle = std::thread::Builder::new()
         .name("quay-worker".to_string())
-        .spawn(move || ctx.run())
+        .spawn(move || {
+            let _guard = handle.enter();
+            ctx.run()
+        })
         .map_err(notify::Error::io)?;
 
     Ok((watcher, worker_handle))
@@ -1342,7 +1351,7 @@ mod tests {
 
     #[test]
     fn worker_context_exits_when_channel_closes() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1361,9 +1370,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Drop the sender to close the channel.
         drop(tx);
@@ -1376,7 +1390,7 @@ mod tests {
 
     #[test]
     fn worker_context_handles_error_events() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1395,14 +1409,19 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send error events — should be logged but not crash the worker.
-        tx.send(Err(notify::Error::generic("test error 1")))
+        tx.send((Err(notify::Error::generic("test error 1")), Instant::now()))
             .unwrap();
-        tx.send(Err(notify::Error::generic("test error 2")))
+        tx.send((Err(notify::Error::generic("test error 2")), Instant::now()))
             .unwrap();
 
         // Close channel to let worker exit.
@@ -1417,7 +1436,7 @@ mod tests {
 
     #[test]
     fn worker_context_skips_irrelevant_events() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1436,9 +1455,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send an access event (irrelevant) — should not produce any broadcast.
         let access_event = Event {
@@ -1446,10 +1470,10 @@ mod tests {
             paths: vec![dir.join("file.txt")],
             attrs: Default::default(),
         };
-        tx.send(Ok(access_event)).unwrap();
+        tx.send((Ok(access_event), Instant::now())).unwrap();
 
         // Give worker time to process.
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // No broadcast should have been sent.
         assert!(brx.try_recv().is_err());
@@ -1462,7 +1486,7 @@ mod tests {
 
     #[test]
     fn worker_context_processes_relevant_events() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1486,9 +1510,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send a modify-data event for an HTML file.
         let event = Event {
@@ -1498,10 +1527,10 @@ mod tests {
             paths: vec![html_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
         // Give worker time to process.
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should have broadcast a reload for the HTML file.
         let msg = brx.try_recv().expect("should receive a broadcast");
@@ -1515,7 +1544,7 @@ mod tests {
 
     #[test]
     fn worker_context_processes_css_with_config() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(vec!["styles".to_string()]);
 
@@ -1550,9 +1579,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send a create event for the CSS file.
         let event = Event {
@@ -1560,10 +1594,10 @@ mod tests {
             paths: vec![css_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
         // Give worker time to process.
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(1500));
 
         let msg = brx.try_recv().expect("should receive a broadcast");
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -1577,7 +1611,7 @@ mod tests {
 
     #[test]
     fn worker_context_skips_filtered_paths() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1599,9 +1633,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send a modify event for a .tmp file — should be filtered out.
         let event = Event {
@@ -1611,9 +1650,9 @@ mod tests {
             paths: vec![dir.join("cache.tmp")],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // No broadcast should have been produced.
         assert!(brx.try_recv().is_err());
@@ -1632,7 +1671,7 @@ mod tests {
 
     #[test]
     fn worker_context_with_diff_store_records_changes() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1658,9 +1697,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
@@ -1669,12 +1713,12 @@ mod tests {
             paths: vec![file_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // The diff store should have recorded the change.
-        let guard = diff_store.lock().unwrap();
+        let guard = diff_store.lock();
         let keys = guard.list_keys();
         assert!(!keys.is_empty(), "diff store should have at least one key");
 
@@ -1693,7 +1737,7 @@ mod tests {
 
     #[test]
     fn worker_context_detects_config_change() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["original".to_string()]);
 
@@ -1723,9 +1767,14 @@ mod tests {
             cmd_timeout: None,
             config_path: canonical.clone(),
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send an event for the config file path itself.
         let event = Event {
@@ -1735,13 +1784,13 @@ mod tests {
             paths: vec![canonical.to_path_buf()],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Status map should now contain "reloaded" instead of "original".
         {
-            let guard = statuses.lock().unwrap();
+            let guard = statuses.lock();
             assert!(
                 guard.contains_key("reloaded"),
                 "status map should contain the reloaded config name, got: {:?}",
@@ -1766,7 +1815,7 @@ mod tests {
 
     #[test]
     fn worker_context_handles_multi_path_event() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1792,9 +1841,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Single event with two paths.
         let event = Event {
@@ -1802,9 +1856,9 @@ mod tests {
             paths: vec![html1, html2],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should receive two broadcast messages (one per path).
         let msg1 = brx.try_recv().expect("first path broadcast");
@@ -1822,7 +1876,7 @@ mod tests {
 
     #[test]
     fn worker_context_handles_empty_paths_event() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1842,9 +1896,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Event with no paths at all — should be handled gracefully.
         let event = Event {
@@ -1852,9 +1911,9 @@ mod tests {
             paths: vec![],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // No broadcast expected.
         assert!(brx.try_recv().is_err());
@@ -1869,7 +1928,7 @@ mod tests {
 
     #[test]
     fn worker_context_generic_fallback_runs_command_and_reloads() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1894,9 +1953,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
@@ -1905,9 +1969,9 @@ mod tests {
             paths: vec![rs_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // The generic fallback should broadcast a reload.
         let msg = brx.try_recv().expect("should receive reload broadcast");
@@ -1923,7 +1987,7 @@ mod tests {
 
     #[test]
     fn worker_context_css_fallback_injects_css() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -1947,9 +2011,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
@@ -1958,9 +2027,9 @@ mod tests {
             paths: vec![css_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         let msg = brx.try_recv().expect("should receive inject-css broadcast");
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -1976,7 +2045,7 @@ mod tests {
 
     #[test]
     fn worker_context_htm_extension_triggers_reload() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -2000,18 +2069,23 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![htm_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         let msg = brx
             .try_recv()
@@ -2028,7 +2102,7 @@ mod tests {
 
     #[test]
     fn worker_context_rapid_fire_events_no_panic() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _brx) = broadcast::channel::<String>(256);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -2055,9 +2129,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(2)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Blast 200 events rapidly.
         for i in 0..200 {
@@ -2069,10 +2148,10 @@ mod tests {
                 paths: vec![dir.join(format!("file_{}.html", file_idx))],
                 attrs: Default::default(),
             };
-            tx.send(Ok(event)).unwrap();
+            tx.send((Ok(event), Instant::now())).unwrap();
         }
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         drop(tx);
         handle
@@ -2086,7 +2165,7 @@ mod tests {
 
     #[test]
     fn worker_context_mixed_event_types_no_panic() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _brx) = broadcast::channel::<String>(64);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -2106,9 +2185,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(1)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let kinds = vec![
             EventKind::Create(notify::event::CreateKind::File),
@@ -2149,16 +2233,16 @@ mod tests {
                     paths: vec![path.clone()],
                     attrs: Default::default(),
                 };
-                let _ = tx.send(Ok(event));
+                let _ = tx.send((Ok(event), Instant::now()));
             }
         }
 
         // Also throw in some errors.
         for _ in 0..5 {
-            let _ = tx.send(Err(notify::Error::generic("chaos error")));
+            let _ = tx.send((Err(notify::Error::generic("chaos error")), Instant::now()));
         }
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         drop(tx);
         handle
@@ -2333,7 +2417,7 @@ mod tests {
 
     #[test]
     fn worker_context_diff_store_with_config_match() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["css".to_string()]);
 
@@ -2370,9 +2454,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // "Change" the file.
         std::fs::write(&css_path, ".new { color: white; }").unwrap();
@@ -2384,9 +2473,9 @@ mod tests {
             paths: vec![css_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should have an inject-css broadcast.
         let msg = brx.try_recv().expect("should receive broadcast");
@@ -2394,7 +2483,7 @@ mod tests {
         assert_eq!(parsed["type"], "inject-css");
 
         // Diff store should have recorded the change.
-        let guard = diff_store.lock().unwrap();
+        let guard = diff_store.lock();
         assert!(
             !guard.list_keys().is_empty(),
             "diff store should have tracked the file"
@@ -2403,7 +2492,7 @@ mod tests {
         // Status should have cycled through "reloading" back to "up to date".
         drop(guard);
         {
-            let st = statuses.lock().unwrap();
+            let st = statuses.lock();
             assert_eq!(st.get("css").map(|s| s.as_str()), Some("up to date"));
         }
 
@@ -2417,7 +2506,7 @@ mod tests {
 
     #[test]
     fn worker_context_interleaved_errors_and_events() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(32);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -2440,22 +2529,30 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Interleave errors and valid events.
-        tx.send(Err(notify::Error::generic("err1"))).unwrap();
+        tx.send((Err(notify::Error::generic("err1")), Instant::now()))
+            .unwrap();
         let valid_event = Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![html_path.clone()],
             attrs: Default::default(),
         };
-        tx.send(Ok(valid_event)).unwrap();
-        tx.send(Err(notify::Error::generic("err2"))).unwrap();
-        tx.send(Err(notify::Error::generic("err3"))).unwrap();
+        tx.send((Ok(valid_event), Instant::now())).unwrap();
+        tx.send((Err(notify::Error::generic("err2")), Instant::now()))
+            .unwrap();
+        tx.send((Err(notify::Error::generic("err3")), Instant::now()))
+            .unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // The valid event should still produce a broadcast despite the errors.
         let msg = brx
@@ -2475,7 +2572,7 @@ mod tests {
 
     #[test]
     fn worker_context_debouncer_suppresses_within_window() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(32);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -2494,13 +2591,18 @@ mod tests {
             configs: vec![],
             statuses,
             cmd_template: "echo debounce".to_string(),
-            debouncer: Debouncer::new(Duration::from_secs(60)), // Very long debounce.
+            debouncer: Debouncer::new(Duration::from_millis(100)), // Short debounce for test.
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send the same event 10 times — only the first should produce a broadcast.
         for _ in 0..10 {
@@ -2511,10 +2613,10 @@ mod tests {
                 paths: vec![html_path.clone()],
                 attrs: Default::default(),
             };
-            tx.send(Ok(event)).unwrap();
+            tx.send((Ok(event), Instant::now())).unwrap();
         }
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should receive exactly one broadcast.
         let msg = brx.try_recv().expect("first event should broadcast");
@@ -2685,7 +2787,7 @@ mod tests {
 
     #[test]
     fn worker_context_on_change_takes_priority_over_build() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["test".to_string()]);
 
@@ -2720,9 +2822,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(5)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
@@ -2731,9 +2838,9 @@ mod tests {
             paths: vec![js_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         let msg = brx.try_recv().expect("should receive broadcast");
         assert!(msg.contains("reload"));
@@ -2748,7 +2855,7 @@ mod tests {
 
     #[test]
     fn worker_context_config_notify_only_no_command() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["notifyonly".to_string()]);
 
@@ -2783,18 +2890,23 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![js_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should still broadcast even without a command.
         let msg = brx.try_recv().expect("should broadcast reload");
@@ -2810,7 +2922,7 @@ mod tests {
 
     #[test]
     fn worker_context_multiple_configs_all_matching_run() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(32);
         let statuses =
             crate::server::new_status_map(vec!["first".to_string(), "second".to_string()]);
@@ -2858,18 +2970,23 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![css_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Both configs match, so we should get two broadcasts.
         let msg1 = brx.try_recv().expect("first config should broadcast");
@@ -2887,7 +3004,7 @@ mod tests {
 
     #[test]
     fn worker_context_config_ignore_skips_matching_paths() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["filtered".to_string()]);
 
@@ -2926,18 +3043,23 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         let event = Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![js_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Global filter should block the path before config matching.
         assert!(
@@ -2955,7 +3077,7 @@ mod tests {
 
     #[test]
     fn worker_context_remove_event_triggers_fallback() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -2975,9 +3097,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(2)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // A remove event for a .rs file — should trigger generic fallback.
         let event = Event {
@@ -2985,9 +3112,9 @@ mod tests {
             paths: vec![dir.join("deleted.rs")],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         let msg = brx
             .try_recv()
@@ -3004,7 +3131,7 @@ mod tests {
 
     #[test]
     fn worker_context_rename_event_is_processed() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -3029,9 +3156,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Rename event with both old and new paths.
         let event = Event {
@@ -3041,9 +3173,9 @@ mod tests {
             paths: vec![old_path, new_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should receive broadcasts for both the old and new paths.
         let msg1 = brx
@@ -3061,7 +3193,7 @@ mod tests {
 
     #[test]
     fn worker_context_rapid_create_delete_cycle() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _brx) = broadcast::channel::<String>(256);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -3083,9 +3215,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(1)),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Simulate rapid create → modify → remove cycles.
         for i in 0..30 {
@@ -3093,35 +3230,44 @@ mod tests {
 
             // Create.
             std::fs::write(&file, format!("v{}", i)).unwrap();
-            tx.send(Ok(Event {
-                kind: EventKind::Create(notify::event::CreateKind::File),
-                paths: vec![file.clone()],
-                attrs: Default::default(),
-            }))
+            tx.send((
+                Ok(Event {
+                    kind: EventKind::Create(notify::event::CreateKind::File),
+                    paths: vec![file.clone()],
+                    attrs: Default::default(),
+                }),
+                Instant::now(),
+            ))
             .unwrap();
 
             // Modify.
             std::fs::write(&file, format!("v{}_modified", i)).unwrap();
-            tx.send(Ok(Event {
-                kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                    notify::event::DataChange::Content,
-                )),
-                paths: vec![file.clone()],
-                attrs: Default::default(),
-            }))
+            tx.send((
+                Ok(Event {
+                    kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                        notify::event::DataChange::Content,
+                    )),
+                    paths: vec![file.clone()],
+                    attrs: Default::default(),
+                }),
+                Instant::now(),
+            ))
             .unwrap();
 
             // Remove.
             let _ = std::fs::remove_file(&file);
-            tx.send(Ok(Event {
-                kind: EventKind::Remove(notify::event::RemoveKind::File),
-                paths: vec![file],
-                attrs: Default::default(),
-            }))
+            tx.send((
+                Ok(Event {
+                    kind: EventKind::Remove(notify::event::RemoveKind::File),
+                    paths: vec![file],
+                    attrs: Default::default(),
+                }),
+                Instant::now(),
+            ))
             .unwrap();
         }
 
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(1500));
 
         drop(tx);
         handle
@@ -3135,7 +3281,7 @@ mod tests {
 
     #[test]
     fn worker_context_concurrent_event_senders() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _brx) = broadcast::channel::<String>(512);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -3160,9 +3306,14 @@ mod tests {
             cmd_timeout: Some(Duration::from_secs(2)),
             config_path: cfg_path,
             diff_store: None,
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Spawn 5 threads each sending 20 events.
         let mut sender_handles = Vec::new();
@@ -3179,7 +3330,7 @@ mod tests {
                         paths: vec![dir_clone.join(format!("f{}.html", file_idx))],
                         attrs: Default::default(),
                     };
-                    let _ = tx_clone.send(Ok(event));
+                    let _ = tx_clone.send((Ok(event), Instant::now()));
                 }
             }));
         }
@@ -3188,7 +3339,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         drop(tx);
         handle
@@ -3247,7 +3398,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = dir.join("quay.yaml");
 
-        // UTF-8 BOM + valid YAML.  serde_yaml may or may not handle the BOM
+        // UTF-8 BOM + valid YAML.  serde_yml may or may not handle the BOM
         // gracefully — the key property is that it must not panic.
         let yaml = "\u{FEFF}- name: bom\n  watch: \"**/*.rs\"\n";
         std::fs::write(&cfg_path, yaml).unwrap();
@@ -3266,7 +3417,7 @@ mod tests {
 
     #[test]
     fn worker_context_diff_store_handles_missing_file() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -3288,9 +3439,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send event for a file that doesn't exist on disk.
         let event = Event {
@@ -3298,9 +3454,9 @@ mod tests {
             paths: vec![dir.join("gone.rs")],
             attrs: Default::default(),
         };
-        tx.send(Ok(event)).unwrap();
+        tx.send((Ok(event), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // Should not panic. Diff store might or might not record it — key
         // property is no crash.
@@ -3317,7 +3473,7 @@ mod tests {
 
     #[test]
     fn worker_context_diff_store_skips_filtered_paths() {
-        let (tx, rx) = std_mpsc::channel::<NotifyResult<Event>>();
+        let (tx, rx) = std_mpsc::channel::<(NotifyResult<Event>, Instant)>();
         let (btx, _brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
@@ -3350,9 +3506,14 @@ mod tests {
             cmd_timeout: None,
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            cancel: CancellationToken::new(),
         };
 
-        let handle = std::thread::spawn(move || ctx.run());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            ctx.run()
+        });
 
         // Send event for the filtered .tmp file.
         let event_tmp = Event {
@@ -3362,7 +3523,7 @@ mod tests {
             paths: vec![tmp_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event_tmp)).unwrap();
+        tx.send((Ok(event_tmp), Instant::now())).unwrap();
 
         // Send event for the allowed .rs file.
         let event_rs = Event {
@@ -3372,12 +3533,12 @@ mod tests {
             paths: vec![rs_path],
             attrs: Default::default(),
         };
-        tx.send(Ok(event_rs)).unwrap();
+        tx.send((Ok(event_rs), Instant::now())).unwrap();
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1500));
 
         // The diff store should only have the allowed file, NOT the filtered one.
-        let guard = diff_store.lock().unwrap();
+        let guard = diff_store.lock();
         let keys = guard.list_keys();
 
         // The .tmp file must not appear in the diff store.

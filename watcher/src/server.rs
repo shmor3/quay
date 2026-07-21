@@ -15,15 +15,16 @@
 //!   rather than a panic.
 
 use futures::{SinkExt, StreamExt};
+use parking_lot::Mutex;
+use prometheus::IntGauge;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use prometheus::IntGauge;
 
 use crate::watcher;
 
@@ -57,11 +58,8 @@ pub fn new_status_map(names: impl IntoIterator<Item = String>) -> StatusMap {
 /// If the lock is poisoned (a thread panicked while holding it), the update is
 /// silently skipped and a warning is logged.
 pub fn set_status(statuses: &StatusMap, name: &str, status: &str) {
-    if let Ok(mut guard) = statuses.lock() {
-        guard.insert(name.to_string(), status.to_string());
-    } else {
-        warn!(name, "status map lock poisoned; skipping status update");
-    }
+    let mut guard = statuses.lock();
+    guard.insert(name.to_string(), status.to_string());
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +83,9 @@ pub fn spawn_ws_server(
     _tls_key: Option<String>,
     _max_connections: Option<u32>,
 ) {
-    let ws_gauge = IntGauge::new("quay_ws_connections", "WebSocket connections").unwrap();
+    let ws_gauge = IntGauge::new("quay_ws_connections", "WebSocket connections")
+        .expect("failed to create ws_connections gauge");
+    let _ = prometheus::default_registry().register(Box::new(ws_gauge.clone()));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -173,7 +173,8 @@ async fn handle_ws_client(
                 msg = rx.recv() => {
                     match msg {
                         Ok(text) => {
-                            if ws_tx.send(Message::Text(text)).await.is_err() {
+                            if let Err(e) = ws_tx.send(Message::Text(text)).await {
+                                warn!(%addr, error = %e, "failed to send broadcast message to client");
                                 break;
                             }
                         }
@@ -188,12 +189,19 @@ async fn handle_ws_client(
     });
 
     // Drain incoming messages (we don't use them) to detect disconnects.
+    let mut message_count = 0;
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
             frame = ws_rx.next() => {
                 match frame {
-                    Some(Ok(_)) => { /* ignore client messages */ }
+                    Some(Ok(_)) => {
+                        message_count += 1;
+                        if message_count > 100 {
+                            warn!(%addr, "WebSocket client sent too many messages, disconnecting");
+                            break;
+                        }
+                    }
                     _ => break,
                 }
             }
@@ -221,7 +229,7 @@ mod tests {
     #[test]
     fn new_status_map_populates_entries() {
         let map = new_status_map(vec!["a".to_string(), "b".to_string()]);
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.get("a").unwrap(), "up to date");
         assert_eq!(guard.get("b").unwrap(), "up to date");
         assert_eq!(guard.len(), 2);
@@ -230,14 +238,14 @@ mod tests {
     #[test]
     fn new_status_map_empty_input() {
         let map = new_status_map(Vec::<String>::new());
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert!(guard.is_empty());
     }
 
     #[test]
     fn new_status_map_single_entry() {
         let map = new_status_map(vec!["only".to_string()]);
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.len(), 1);
         assert_eq!(guard.get("only").unwrap(), "up to date");
     }
@@ -246,7 +254,7 @@ mod tests {
     fn new_status_map_duplicate_names_deduplicates() {
         // HashMap naturally deduplicates keys.
         let map = new_status_map(vec!["dup".to_string(), "dup".to_string()]);
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.len(), 1);
         assert_eq!(guard.get("dup").unwrap(), "up to date");
     }
@@ -258,7 +266,7 @@ mod tests {
             "path/to/thing".to_string(),
             "émojis 🎉".to_string(),
         ]);
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.len(), 3);
         assert_eq!(guard.get("émojis 🎉").unwrap(), "up to date");
     }
@@ -271,7 +279,7 @@ mod tests {
     fn set_status_updates_entry() {
         let map = new_status_map(vec!["cfg".to_string()]);
         set_status(&map, "cfg", "reloading");
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.get("cfg").unwrap(), "reloading");
     }
 
@@ -279,7 +287,7 @@ mod tests {
     fn set_status_creates_new_entry() {
         let map = new_status_map(Vec::<String>::new());
         set_status(&map, "new_cfg", "building");
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.get("new_cfg").unwrap(), "building");
     }
 
@@ -289,7 +297,7 @@ mod tests {
         set_status(&map, "x", "first");
         set_status(&map, "x", "second");
         set_status(&map, "x", "third");
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.get("x").unwrap(), "third");
     }
 
@@ -297,7 +305,7 @@ mod tests {
     fn set_status_empty_strings() {
         let map = new_status_map(Vec::<String>::new());
         set_status(&map, "", "");
-        let guard = map.lock().unwrap();
+        let guard = map.lock();
         assert_eq!(guard.get("").unwrap(), "");
     }
 
@@ -318,7 +326,15 @@ mod tests {
         let cancel = CancellationToken::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        spawn_ws_server(listener, btx.clone(), cancel.clone(), counter.clone(), None, None, None);
+        spawn_ws_server(
+            listener,
+            btx.clone(),
+            cancel.clone(),
+            counter.clone(),
+            None,
+            None,
+            None,
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -529,4 +545,3 @@ mod tests {
         }
     }
 }
-

@@ -7,7 +7,6 @@ use std::path::PathBuf;
 /// Some variants are not yet constructed but are defined for completeness and
 /// future use by downstream consumers of this module.
 
-
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum WatchdError {
@@ -18,13 +17,24 @@ pub enum WatchdError {
     Notify(#[source] notify::Error, Option<String>),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>, Option<String>),
+    WebSocket(
+        #[source] Box<tokio_tungstenite::tungstenite::Error>,
+        Option<String>,
+    ),
 
     #[error("failed to parse config at {path}: {reason}")]
-    ConfigParse { path: PathBuf, reason: String, user_message: Option<String> },
+    ConfigParse {
+        path: PathBuf,
+        reason: String,
+        user_message: Option<String>,
+    },
 
     #[error("invalid glob pattern '{pattern}': {reason}")]
-    InvalidGlob { pattern: String, reason: String, user_message: Option<String> },
+    InvalidGlob {
+        pattern: String,
+        reason: String,
+        user_message: Option<String>,
+    },
 
     #[error("failed to bind to {addr}: {source}")]
     Bind {
@@ -35,7 +45,11 @@ pub enum WatchdError {
     },
 
     #[error("failed to execute command '{cmd}': {reason}")]
-    CommandExec { cmd: String, reason: String, user_message: Option<String> },
+    CommandExec {
+        cmd: String,
+        reason: String,
+        user_message: Option<String>,
+    },
 
     #[error("failed to connect to control socket at {addr}: {source}")]
     ControlConnect {
@@ -90,7 +104,10 @@ mod tests {
     #[test]
     fn notify_error_display() {
         let inner = notify::Error::generic("watcher exploded");
-        let err = WatchdError::Notify(inner, Some("Check file watcher configuration and supported events.".to_string()));
+        let err = WatchdError::Notify(
+            inner,
+            Some("Check file watcher configuration and supported events.".to_string()),
+        );
         let msg = err.to_string();
         assert!(msg.contains("file watcher error"), "got: {msg}");
         assert!(msg.contains("watcher exploded"), "got: {msg}");
@@ -99,7 +116,10 @@ mod tests {
     #[test]
     fn websocket_error_display() {
         let inner = tokio_tungstenite::tungstenite::Error::ConnectionClosed;
-        let err = WatchdError::WebSocket(Box::new(inner), Some("Check WebSocket server address and port.".to_string()));
+        let err = WatchdError::WebSocket(
+            Box::new(inner),
+            Some("Check WebSocket server address and port.".to_string()),
+        );
         let msg = err.to_string();
         assert!(msg.contains("WebSocket error"), "got: {msg}");
     }
@@ -303,9 +323,10 @@ mod tests {
         let variants: Vec<WatchdError> = vec![
             WatchdError::Io(std::io::Error::other("x"), None),
             WatchdError::Notify(notify::Error::generic("x"), None),
-            WatchdError::WebSocket(Box::new(
-                tokio_tungstenite::tungstenite::Error::ConnectionClosed,
-            ), None),
+            WatchdError::WebSocket(
+                Box::new(tokio_tungstenite::tungstenite::Error::ConnectionClosed),
+                None,
+            ),
             WatchdError::ConfigParse {
                 path: PathBuf::from("a"),
                 reason: "b".into(),

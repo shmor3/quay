@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Debouncer
@@ -28,12 +28,8 @@ use tracing::{debug, warn};
 pub(crate) struct Debouncer {
     /// Minimum interval between handling the same path.
     pub(crate) window: Duration,
-    /// Last time each path was handled.
-    pub(crate) last_seen: HashMap<String, Instant>,
-    /// Number of events processed since the last prune.
-    pub(crate) events_since_prune: u64,
-    /// Prune the map every N events.
-    pub(crate) prune_interval: u64,
+    /// Pending events to be processed (deferred).
+    pub(crate) pending: HashMap<String, Instant>,
 }
 
 impl Debouncer {
@@ -51,48 +47,54 @@ impl Debouncer {
         };
         Self {
             window,
-            last_seen: HashMap::new(),
-            events_since_prune: 0,
-            prune_interval: 1000,
+            pending: HashMap::new(),
         }
     }
 
-    /// Returns `true` if the path should be processed (i.e. enough time has
-    /// elapsed since the last event for this path).
-    ///
-    /// Internally the map is pruned every [`prune_interval`](Self::prune_interval)
-    /// events to prevent unbounded growth during long-running sessions.
-    /// Entries older than 10× the debounce window are considered stale and
-    /// removed.
-    pub(crate) fn should_handle(&mut self, path: &str) -> bool {
-        let now = Instant::now();
-        let dominated = match self.last_seen.get(path) {
-            Some(prev) => now.duration_since(*prev) <= self.window,
-            None => false,
-        };
-        self.last_seen.insert(path.to_string(), now);
+    /// Add an event generated at `event_time`. We keep the latest event time.
+    pub(crate) fn add_event(&mut self, path: String, event_time: Instant) {
+        let current = self.pending.entry(path).or_insert(event_time);
+        if event_time > *current {
+            *current = event_time;
+        }
+    }
 
-        // Periodic pruning: remove entries older than 10× the debounce window
-        // so that the map does not grow without bound in sessions that touch
-        // many distinct paths over hours/days.
-        self.events_since_prune += 1;
-        if self.events_since_prune >= self.prune_interval {
-            self.events_since_prune = 0;
-            let stale_threshold = self.window.saturating_mul(10);
-            let before = self.last_seen.len();
-            self.last_seen
-                .retain(|_, ts| now.duration_since(*ts) < stale_threshold);
-            let pruned = before.saturating_sub(self.last_seen.len());
-            if pruned > 0 {
-                debug!(
-                    pruned,
-                    remaining = self.last_seen.len(),
-                    "debouncer pruned stale entries"
-                );
+    /// Drain events that have been quiet for `window` duration.
+    pub(crate) fn drain_ready(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let mut ready = Vec::new();
+        self.pending.retain(|path, ts| {
+            if now >= *ts && now.duration_since(*ts) >= self.window {
+                ready.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready
+    }
+
+    /// Calculate the duration until the next event is ready.
+    pub(crate) fn next_timeout(&self) -> Option<Duration> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let mut min_wait = self.window;
+        for ts in self.pending.values() {
+            if now >= *ts {
+                let elapsed = now.duration_since(*ts);
+                if elapsed >= self.window {
+                    return Some(Duration::ZERO);
+                } else {
+                    let wait = self.window - elapsed;
+                    if wait < min_wait {
+                        min_wait = wait;
+                    }
+                }
             }
         }
-
-        !dominated
+        Some(min_wait)
     }
 }
 
@@ -104,15 +106,6 @@ impl Debouncer {
 mod tests {
     use super::*;
 
-    // -- Construction & defaults -------------------------------------------
-
-    #[test]
-    fn new_sets_default_prune_interval() {
-        let d = Debouncer::new(Duration::from_millis(200));
-        assert_eq!(d.prune_interval, 1000);
-        assert_eq!(d.events_since_prune, 0);
-    }
-
     #[test]
     fn new_stores_window() {
         let d = Debouncer::new(Duration::from_millis(500));
@@ -122,10 +115,8 @@ mod tests {
     #[test]
     fn new_starts_with_empty_map() {
         let d = Debouncer::new(Duration::from_millis(200));
-        assert!(d.last_seen.is_empty());
+        assert!(d.pending.is_empty());
     }
-
-    // -- Zero window clamping ----------------------------------------------
 
     #[test]
     fn zero_window_clamped_to_1ms() {
@@ -134,224 +125,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_window_still_debounces() {
-        let mut d = Debouncer::new(Duration::from_millis(0));
-        assert!(d.should_handle("file.txt"));
-        // Immediate second event should be suppressed (1ms window).
-        assert!(!d.should_handle("file.txt"));
-    }
-
-    // -- Basic behaviour ---------------------------------------------------
-
-    #[test]
-    fn allows_first_event() {
-        let mut d = Debouncer::new(Duration::from_millis(200));
-        assert!(d.should_handle("src/main.rs"));
-    }
-
-    #[test]
-    fn suppresses_rapid_duplicates() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        assert!(d.should_handle("src/main.rs"));
-        // Second call within the window should be suppressed.
-        assert!(!d.should_handle("src/main.rs"));
-    }
-
-    #[test]
-    fn allows_different_paths() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        assert!(d.should_handle("a.txt"));
-        assert!(d.should_handle("b.txt"));
-    }
-
-    #[test]
-    fn rapid_same_path_only_first_passes() {
-        let mut d = Debouncer::new(Duration::from_secs(60));
-        assert!(d.should_handle("same.txt"));
-        for _ in 0..100 {
-            assert!(!d.should_handle("same.txt"));
-        }
-    }
-
-    // -- Window expiry -----------------------------------------------------
-
-    #[test]
-    fn allows_after_window_expires() {
-        let mut d = Debouncer::new(Duration::from_millis(10));
-        assert!(d.should_handle("file.rs"));
-        // Wait for the debounce window to expire.
-        std::thread::sleep(Duration::from_millis(20));
-        // Should be allowed again.
-        assert!(d.should_handle("file.rs"));
-    }
-
-    #[test]
-    fn boundary_window() {
+    fn defers_events_correctly() {
         let mut d = Debouncer::new(Duration::from_millis(50));
-        assert!(d.should_handle("boundary.txt"));
-        // Sleep just past the window.
+        let now = Instant::now();
+        d.add_event("a.txt".to_string(), now);
+        assert!(d.drain_ready().is_empty());
         std::thread::sleep(Duration::from_millis(60));
-        assert!(
-            d.should_handle("boundary.txt"),
-            "should pass after window expires"
-        );
-    }
-
-    // -- Large/edge window values ------------------------------------------
-
-    #[test]
-    fn very_large_window() {
-        let mut d = Debouncer::new(Duration::from_secs(3600)); // 1 hour
-        assert!(d.should_handle("a.txt"));
-        assert!(!d.should_handle("a.txt")); // within window
-        assert!(d.should_handle("b.txt")); // different path
-    }
-
-    // -- Many distinct paths -----------------------------------------------
-
-    #[test]
-    fn many_distinct_paths() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        for i in 0..1000 {
-            let path = format!("path/{}/file_{}.rs", i / 10, i);
-            assert!(d.should_handle(&path));
-        }
-        // All 1000 distinct paths should be in the map.
-        assert_eq!(d.last_seen.len(), 1000);
-    }
-
-    // -- Pruning -----------------------------------------------------------
-
-    #[test]
-    fn prune_removes_stale_entries() {
-        let mut d = Debouncer::new(Duration::from_millis(1));
-        d.prune_interval = 2;
-
-        d.should_handle("old.txt");
-        // Sleep long enough for the entry to become stale (10× window = 10ms).
-        std::thread::sleep(Duration::from_millis(20));
-        // Trigger two more events to force a prune.
-        d.should_handle("trigger1.txt");
-        d.should_handle("trigger2.txt");
-
-        // "old.txt" should have been pruned.
-        assert!(!d.last_seen.contains_key("old.txt"));
-    }
-
-    #[test]
-    fn prune_keeps_recent_entries() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        d.prune_interval = 2;
-
-        d.should_handle("fresh.txt");
-        d.should_handle("trigger1.txt");
-        d.should_handle("trigger2.txt"); // triggers prune
-
-        // All entries are fresh (within 10× 10s = 100s), so none should be pruned.
-        assert!(d.last_seen.contains_key("fresh.txt"));
-        assert!(d.last_seen.contains_key("trigger1.txt"));
-        assert!(d.last_seen.contains_key("trigger2.txt"));
-    }
-
-    #[test]
-    fn prune_actually_removes_stale() {
-        let mut d = Debouncer::new(Duration::from_millis(1));
-        d.prune_interval = 3; // prune after every 3 events
-
-        // Insert a path.
-        d.should_handle("old.txt");
-        // Sleep so it becomes stale (10× window = 10ms).
-        std::thread::sleep(Duration::from_millis(20));
-
-        // Insert 3 more events to trigger prune.
-        d.should_handle("a.txt");
-        d.should_handle("b.txt");
-        d.should_handle("c.txt");
-
-        // "old.txt" should have been pruned.
-        assert!(!d.last_seen.contains_key("old.txt"));
-        // Recent entries should remain.
-        assert!(d.last_seen.contains_key("a.txt"));
-        assert!(d.last_seen.contains_key("b.txt"));
-        assert!(d.last_seen.contains_key("c.txt"));
-    }
-
-    #[test]
-    fn heavy_prune_then_reuse() {
-        let mut d = Debouncer::new(Duration::from_millis(1));
-        d.prune_interval = 50;
-
-        // Insert many paths.
-        for i in 0..100 {
-            d.should_handle(&format!("path_{}.txt", i));
-        }
-
-        // Sleep so all entries become stale.
-        std::thread::sleep(Duration::from_millis(20));
-
-        // Insert enough to trigger prune.
-        for i in 100..160 {
-            d.should_handle(&format!("path_{}.txt", i));
-        }
-
-        // Old entries should have been pruned.
-        assert!(
-            d.last_seen.len() < 120,
-            "stale entries should have been pruned, got {} entries",
-            d.last_seen.len()
-        );
-
-        // New entries should still be present.
-        assert!(d.last_seen.contains_key("path_159.txt"));
-    }
-
-    // -- Special path values -----------------------------------------------
-
-    #[test]
-    fn empty_path() {
-        let mut d = Debouncer::new(Duration::from_millis(200));
-        assert!(d.should_handle(""));
-        assert!(!d.should_handle(""));
-    }
-
-    #[test]
-    fn unicode_path() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        assert!(d.should_handle("路径/文件.txt"));
-        assert!(!d.should_handle("路径/文件.txt"));
-        assert!(d.should_handle("дорожка/файл.txt"));
-    }
-
-    #[test]
-    fn very_long_path() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        let long_path = "a/".repeat(5000) + "file.txt";
-        assert!(d.should_handle(&long_path));
-        assert!(!d.should_handle(&long_path));
-    }
-
-    #[test]
-    fn special_chars_in_path() {
-        let mut d = Debouncer::new(Duration::from_secs(10));
-        let specials = vec![
-            "file with spaces.txt",
-            "file\twith\ttabs.txt",
-            "file(1).txt",
-            "file[2].txt",
-            "file{3}.txt",
-            "file$var.txt",
-            "file#hash.txt",
-            "file@at.txt",
-            "file!bang.txt",
-            "file%percent.txt",
-        ];
-        for s in &specials {
-            assert!(d.should_handle(s), "first event for '{}' should pass", s);
-            assert!(
-                !d.should_handle(s),
-                "second event for '{}' should be suppressed",
-                s
-            );
-        }
+        assert_eq!(d.drain_ready(), vec!["a.txt".to_string()]);
     }
 }

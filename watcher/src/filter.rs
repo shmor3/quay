@@ -43,7 +43,7 @@ impl PathFilter {
     /// Convenience constructor that merges [`DEFAULT_EXCLUDES`] with any
     /// additional exclude patterns (e.g. from config `ignore` lists).
     pub fn with_defaults(extra_excludes: &[String]) -> Self {
-        let mut excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| (*s).to_string()).collect();
+        let mut excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(ToString::to_string).collect();
         for pat in extra_excludes {
             if !excludes.contains(pat) {
                 excludes.push(pat.clone());
