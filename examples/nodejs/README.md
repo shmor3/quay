@@ -1,6 +1,6 @@
 # Node.js Hot-Reload Client
 
-A server-side Node.js WebSocket client that connects to a running `watchd` server and reacts to file-change notifications. Useful for triggering rebuilds, restarting processes, clearing caches, or any custom logic when files change.
+A server-side Node.js WebSocket client that connects to a running `quay` server and reacts to file-change notifications. Useful for triggering rebuilds, restarting processes, clearing caches, or any custom logic when files change.
 
 ## Requirements
 
@@ -17,10 +17,10 @@ npm install
 npm start
 
 # Or run directly with a custom port
-node hotreload-client.js 4000
+node quay-client.js 4000
 
 # Custom host and port
-node hotreload-client.js 3012 192.168.1.10
+node quay-client.js 3012 192.168.1.10
 ```
 
 ## Usage as a Library
@@ -28,7 +28,7 @@ node hotreload-client.js 3012 192.168.1.10
 You can import `HotReloadClient` into your own Node.js application:
 
 ```js
-const { HotReloadClient } = require("./hotreload-client");
+const { HotReloadClient } = require("./quay-client");
 
 const client = new HotReloadClient({
   host: "localhost",
@@ -49,7 +49,7 @@ client.on("inject-css", ({ path, content }) => {
 });
 
 // Lifecycle events
-client.on("connected", () => console.log("Connected to watchd"));
+client.on("connected", () => console.log("Connected to quay"));
 client.on("disconnected", () => console.log("Lost connection"));
 client.on("error", (err) => console.error("Error:", err.message));
 

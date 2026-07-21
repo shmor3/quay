@@ -1,24 +1,24 @@
-//! Centralized error types for the watchd application.
+//! Centralized error types for the quay application.
 
 use std::path::PathBuf;
 
-/// Top-level error type for the watchd application.
+/// Top-level error type for the quay application.
 ///
 /// Some variants are not yet constructed but are defined for completeness and
 /// future use by downstream consumers of this module.
+
+
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
-use notify;
-
 pub enum WatchdError {
     #[error("I/O error: {0}")]
-    Io(std::io::Error, Option<String>),
+    Io(#[source] std::io::Error, Option<String>),
 
     #[error("file watcher error: {0}")]
-    Notify(notify::Error, Option<String>),
+    Notify(#[source] notify::Error, Option<String>),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(Box<tokio_tungstenite::tungstenite::Error>, Option<String>),
+    WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>, Option<String>),
 
     #[error("failed to parse config at {path}: {reason}")]
     ConfigParse { path: PathBuf, reason: String, user_message: Option<String> },
@@ -46,6 +46,24 @@ pub enum WatchdError {
     },
 }
 
+impl From<std::io::Error> for WatchdError {
+    fn from(e: std::io::Error) -> Self {
+        WatchdError::Io(e, None)
+    }
+}
+
+impl From<notify::Error> for WatchdError {
+    fn from(e: notify::Error) -> Self {
+        WatchdError::Notify(e, None)
+    }
+}
+
+impl From<Box<tokio_tungstenite::tungstenite::Error>> for WatchdError {
+    fn from(e: Box<tokio_tungstenite::tungstenite::Error>) -> Self {
+        WatchdError::WebSocket(e, None)
+    }
+}
+
 /// Convenience alias used throughout the application.
 pub type Result<T> = std::result::Result<T, WatchdError>;
 
@@ -63,7 +81,7 @@ mod tests {
     #[test]
     fn io_error_display() {
         let inner = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
-        let err = WatchdError::Io(inner);
+        let err = WatchdError::Io(inner, None);
         let msg = err.to_string();
         assert!(msg.contains("I/O error"), "got: {msg}");
         assert!(msg.contains("file gone"), "got: {msg}");
@@ -89,12 +107,13 @@ mod tests {
     #[test]
     fn config_parse_display() {
         let err = WatchdError::ConfigParse {
-            path: PathBuf::from("/tmp/hotreload.yaml"),
+            path: PathBuf::from("/tmp/quay.yaml"),
             reason: "invalid YAML syntax".to_string(),
+            user_message: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("failed to parse config"), "got: {msg}");
-        assert!(msg.contains("hotreload.yaml"), "got: {msg}");
+        assert!(msg.contains("quay.yaml"), "got: {msg}");
         assert!(msg.contains("invalid YAML syntax"), "got: {msg}");
     }
 
@@ -103,6 +122,7 @@ mod tests {
         let err = WatchdError::InvalidGlob {
             pattern: "[unclosed".to_string(),
             reason: "missing closing bracket".to_string(),
+            user_message: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("invalid glob pattern"), "got: {msg}");
@@ -116,6 +136,7 @@ mod tests {
         let err = WatchdError::Bind {
             addr: "127.0.0.1:3012".to_string(),
             source: inner,
+            user_message: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("failed to bind"), "got: {msg}");
@@ -128,6 +149,7 @@ mod tests {
         let err = WatchdError::CommandExec {
             cmd: "npm run build".to_string(),
             reason: "process exited with code 1".to_string(),
+            user_message: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("failed to execute command"), "got: {msg}");
@@ -142,6 +164,7 @@ mod tests {
         let err = WatchdError::ControlConnect {
             addr: "127.0.0.1:3013".to_string(),
             source: inner,
+            user_message: None,
         };
         let msg = err.to_string();
         assert!(
@@ -183,6 +206,7 @@ mod tests {
         let err = WatchdError::Bind {
             addr: "0.0.0.0:80".to_string(),
             source: inner,
+            user_message: None,
         };
         let source = err.source().expect("Bind variant should have a source");
         assert!(source.to_string().contains("in use"));
@@ -194,6 +218,7 @@ mod tests {
         let err = WatchdError::ControlConnect {
             addr: "localhost:3013".to_string(),
             source: inner,
+            user_message: None,
         };
         let source = err
             .source()
@@ -204,7 +229,7 @@ mod tests {
     #[test]
     fn io_error_has_source() {
         let inner = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broken");
-        let err = WatchdError::Io(inner);
+        let err = WatchdError::Io(inner, None);
         // thiserror transparent-wraps #[from] so source is the inner error.
         let source = err.source().expect("Io variant should have a source");
         assert!(source.to_string().contains("pipe broken"));
@@ -215,6 +240,7 @@ mod tests {
         let err = WatchdError::ConfigParse {
             path: PathBuf::from("x.yaml"),
             reason: "bad".to_string(),
+            user_message: None,
         };
         assert!(
             err.source().is_none(),
@@ -227,6 +253,7 @@ mod tests {
         let err = WatchdError::InvalidGlob {
             pattern: "*".to_string(),
             reason: "bad".to_string(),
+            user_message: None,
         };
         assert!(
             err.source().is_none(),
@@ -239,6 +266,7 @@ mod tests {
         let err = WatchdError::CommandExec {
             cmd: "make".to_string(),
             reason: "failed".to_string(),
+            user_message: None,
         };
         assert!(
             err.source().is_none(),
@@ -262,6 +290,7 @@ mod tests {
         let r: Result<i32> = Err(WatchdError::CommandExec {
             cmd: "test".to_string(),
             reason: "fail".to_string(),
+            user_message: None,
         });
         assert!(r.is_err());
     }
@@ -280,22 +309,27 @@ mod tests {
             WatchdError::ConfigParse {
                 path: PathBuf::from("a"),
                 reason: "b".into(),
+                user_message: None,
             },
             WatchdError::InvalidGlob {
                 pattern: "c".into(),
                 reason: "d".into(),
+                user_message: None,
             },
             WatchdError::Bind {
                 addr: "e".into(),
                 source: std::io::Error::other("f"),
+                user_message: None,
             },
             WatchdError::CommandExec {
                 cmd: "g".into(),
                 reason: "h".into(),
+                user_message: None,
             },
             WatchdError::ControlConnect {
                 addr: "i".into(),
                 source: std::io::Error::other("j"),
+                user_message: None,
             },
         ];
         for v in &variants {

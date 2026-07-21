@@ -1,8 +1,8 @@
 [package]
-name = "hotreload-client-example"
+name = "quay-client-example"
 version = "0.1.0"
 edition = "2021"
-description = "Example watchd hot-reload client for Rust"
+description = "Example quay hot-reload client for Rust"
 license = "MIT"
 publish = false
 

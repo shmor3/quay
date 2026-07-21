@@ -1,4 +1,4 @@
-module github.com/watchd/examples/hotreload-client
+module github.com/watchd/examples/quay-client
 
 go 1.21
 

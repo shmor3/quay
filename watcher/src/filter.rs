@@ -18,7 +18,7 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "**/.DS_Store",
     "**/Thumbs.db",
     "**/*.lock",
-    "**/hotreload.yaml",
+    "**/quay.yaml",
 ];
 
 /// Compiled include/exclude filter pair.
@@ -135,7 +135,7 @@ mod tests {
     fn default_excludes_reject_common_dirs() {
         let filter = PathFilter::with_defaults(&[]);
 
-        assert!(!filter.is_allowed("target/debug/watchd"));
+        assert!(!filter.is_allowed("target/debug/quay"));
         assert!(!filter.is_allowed(".git/HEAD"));
         assert!(!filter.is_allowed("node_modules/express/index.js"));
         assert!(!filter.is_allowed("some/path/file.tmp"));
@@ -167,7 +167,7 @@ mod tests {
         assert!(filter.is_allowed("src/main.rs"));
         assert!(filter.is_allowed("src/lib/util.rs"));
         assert!(!filter.is_allowed("tests/integration.py")); // not included
-        assert!(!filter.is_allowed("target/debug/watchd")); // excluded
+        assert!(!filter.is_allowed("target/debug/quay")); // excluded
     }
 
     #[test]
@@ -308,7 +308,7 @@ mod tests {
             "folder/.DS_Store",
             "icons/Thumbs.db",
             "Cargo.lock",
-            "hotreload.yaml",
+            "quay.yaml",
         ] {
             assert!(
                 !filter.is_allowed(pattern_example),
@@ -332,7 +332,7 @@ mod tests {
         assert!(!filter.is_allowed("dist/bundle.js"));
         assert!(!filter.is_allowed("coverage/lcov.info"));
         // Default excludes still in effect.
-        assert!(!filter.is_allowed("target/debug/watchd"));
+        assert!(!filter.is_allowed("target/debug/quay"));
         // Normal files still allowed.
         assert!(filter.is_allowed("src/main.rs"));
     }
@@ -440,6 +440,7 @@ mod tests {
     // -- DEFAULT_EXCLUDES constant -----------------------------------------
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn default_excludes_is_non_empty() {
         assert!(!DEFAULT_EXCLUDES.is_empty());
     }
@@ -464,7 +465,7 @@ mod tests {
         assert!(excludes.contains(&"target/**"));
         assert!(excludes.contains(&".git/**"));
         assert!(excludes.contains(&"node_modules/**"));
-        assert!(excludes.contains(&"**/hotreload.yaml"));
+        assert!(excludes.contains(&"**/quay.yaml"));
     }
 
     // -- PathFilter Clone and Debug ----------------------------------------
@@ -516,8 +517,8 @@ mod tests {
         );
         assert!(filter.is_allowed("src/main.rs"));
         assert!(filter.is_allowed("Cargo.toml"));
-        assert!(!filter.is_allowed("target/debug/watchd"));
-        assert!(!filter.is_allowed("target/release/watchd"));
+        assert!(!filter.is_allowed("target/debug/quay"));
+        assert!(!filter.is_allowed("target/release/quay"));
         assert!(!filter.is_allowed("README.md")); // not in include set
     }
 

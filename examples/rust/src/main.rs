@@ -1,9 +1,9 @@
-//! watchd hot-reload client for Rust
+//! quay hot-reload client for Rust
 //!
-//! A standalone WebSocket client that connects to a running watchd server and
+//! A standalone WebSocket client that connects to a running quay server and
 //! reacts to `reload` and `inject-css` messages. Designed for use in Rust
 //! development tooling, custom dev-servers, or any Rust application that needs
-//! to react to file-change notifications from watchd.
+//! to react to file-change notifications from quay.
 //!
 //! # Usage
 //!
@@ -21,7 +21,7 @@
 //!
 //! # Protocol
 //!
-//! The watchd server sends JSON messages over WebSocket:
+//! The quay server sends JSON messages over WebSocket:
 //!   - `{"type": "reload"}` → full reload
 //!   - `{"type": "inject-css", "path": "...", "content": "..."}` → CSS injection (base64 content)
 //!
@@ -47,7 +47,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 // Protocol types
 // ---------------------------------------------------------------------------
 
-/// A message received from the watchd WebSocket server.
+/// A message received from the quay WebSocket server.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum WatchdMessage {
@@ -100,7 +100,7 @@ fn on_inject_css(path: &str, css: &str) {
 // Client implementation
 // ---------------------------------------------------------------------------
 
-/// Attempt to connect to the watchd server and listen for messages.
+/// Attempt to connect to the quay server and listen for messages.
 /// Returns an error when the connection drops or fails.
 fn connect_and_listen(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     log(&format!("connecting to {}", addr));
@@ -189,12 +189,12 @@ fn run(addr: &str) {
 
 fn log(msg: &str) {
     let now = chrono_or_fallback_timestamp();
-    println!("\x1b[1;31m[hotreload]\x1b[0m [{}] {}", now, msg);
+    println!("\x1b[1;31m[quay]\x1b[0m [{}] {}", now, msg);
 }
 
 fn warn(msg: &str) {
     let now = chrono_or_fallback_timestamp();
-    eprintln!("\x1b[1;33m[hotreload]\x1b[0m [{}] WARNING: {}", now, msg);
+    eprintln!("\x1b[1;33m[quay]\x1b[0m [{}] WARNING: {}", now, msg);
 }
 
 /// Produce a simple HH:MM:SS timestamp using `std::time`.
@@ -228,9 +228,9 @@ fn main() {
         } else if args[1].starts_with("ws://") || args[1].starts_with("wss://") {
             args[1].clone()
         } else {
-            eprintln!("Usage: hotreload-client [--addr] <ws://host:port>");
+            eprintln!("Usage: quay-client [--addr] <ws://host:port>");
             eprintln!(
-                "       hotreload-client                           (defaults to {})",
+                "       quay-client                           (defaults to {})",
                 DEFAULT_ADDR
             );
             std::process::exit(1);
@@ -239,7 +239,7 @@ fn main() {
         DEFAULT_ADDR.to_string()
     };
 
-    println!("watchd hot-reload client for Rust");
+    println!("quay hot-reload client for Rust");
     println!("Connecting to {}", addr);
     println!("Press Ctrl+C to exit.\n");
 

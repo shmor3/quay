@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>watchd Hot-Reload Demo</title>
+  <title>quay Hot-Reload Demo</title>
   <link rel="stylesheet" href="styles.css">
   <style>
     * {
@@ -184,7 +184,7 @@
 </head>
 <body>
   <div class="container">
-    <h1>⚡ watchd Demo</h1>
+    <h1>⚡ quay Demo</h1>
     <p class="subtitle">Hot-reload client running in the browser</p>
 
     <div class="status-card">
@@ -211,21 +211,21 @@
     </div>
 
     <p class="instructions">
-      Start the watcher with <code>watchd --path .</code> and edit files in the
+      Start the watcher with <code>quay --path .</code> and edit files in the
       watched directory to see live events here.<br>
       Modify <code>styles.css</code> to see CSS hot-injection in action.
     </p>
   </div>
 
   <!--
-    watchd hot-reload client.
+    quay hot-reload client.
 
     This demo intercepts messages before they trigger a full page reload so you
     can see the events in the log panel.  In production, simply include the
     script without overrides and reloads happen automatically.
 
     Override the default port with data-port if needed:
-      <script src="/hotreload-client.js" data-port="4000"></script>
+      <script src="/quay-client.js" data-port="4000"></script>
   -->
   <script>
     (function () {
@@ -315,14 +315,14 @@
             : path.replace(/"/g, '\\"');
 
         var existing = document.querySelector(
-          'style[data-hotreload="' + escapedPath + '"]'
+          'style[data-quay="' + escapedPath + '"]'
         );
 
         if (existing) {
           existing.textContent = css;
         } else {
           var style = document.createElement("style");
-          style.setAttribute("data-hotreload", path);
+          style.setAttribute("data-quay", path);
           style.textContent = css;
           document.head.appendChild(style);
         }
@@ -416,7 +416,7 @@
       }
 
       // Bootstrap
-      appendLog("watchd demo client initialised", "info");
+      appendLog("quay demo client initialised", "info");
       if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", connect);
       } else {

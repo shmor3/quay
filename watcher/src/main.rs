@@ -1,4 +1,4 @@
-//! `watchd` – a minimal, language-agnostic file watcher.
+//! `quay` – a minimal, language-agnostic file watcher.
 //!
 //! This binary watches a directory for changes, runs configured commands, and
 //! broadcasts reload / CSS-inject messages to browser clients via WebSocket.
@@ -61,8 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Prometheus metrics setup
     let registry = Registry::new();
-    let health_gauge = IntGauge::new("watchd_health", "Health status of watchd").unwrap();
-    let reload_counter = IntCounter::new("watchd_reload_count", "Reload events").unwrap();
+    let health_gauge = IntGauge::new("quay_health", "Health status of quay").unwrap();
+    let reload_counter = IntCounter::new("quay_reload_count", "Reload events").unwrap();
     registry.register(Box::new(health_gauge.clone())).unwrap();
     registry.register(Box::new(reload_counter.clone())).unwrap();
     let registry = Arc::new(Mutex::new(registry));
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // -----------------------------------------------------------------------
     // Input validation (beyond what clap's type system enforces)
     // -----------------------------------------------------------------------
-    if let Err(msg) = validate::validate_bind_addr(&bind_addr, false) {
+    if let Err(msg) = validate::validate_bind_addr(&bind_addr, args.expose_network) {
         error!("{msg}");
         std::process::exit(1);
     }
@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let control_addr = format!("{}:{}", bind_addr, control_port);
 
     // -----------------------------------------------------------------------
-    // Client-mode subcommands (contact a running watchd instance and exit)
+    // Client-mode subcommands (contact a running quay instance and exit)
     // -----------------------------------------------------------------------
     if let Some(sub) = &args.subcmd {
         match sub {
@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // -----------------------------------------------------------------------
     // Server mode
     // -----------------------------------------------------------------------
-    info!(cmd = %cmd_template, "watchd starting");
+    info!(cmd = %cmd_template, "quay starting");
 
     // Validate and canonicalize the watch root early so the user gets a clear
     // error message rather than a confusing notify failure.
@@ -169,8 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Shared WebSocket connection counter (for status reporting).
     let connection_count = Arc::new(AtomicUsize::new(0));
 
-    // Load configs from `hotreload.yaml` in the watch root.
-    let cfg_path = watch_root.join("hotreload.yaml");
+    // Load configs from `quay.yaml` in the watch root.
+    let cfg_path = watch_root.join("quay.yaml");
     let mut configs: Vec<config::ConfigEntry> = Vec::new();
 
     if cfg_path.exists() {
@@ -189,13 +189,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Err(e) => {
     warn!(path = %cfg_path.display(), error = %e, "failed to read config file");
-    eprintln!("Actionable guidance: Could not read hotreload.yaml. Please check file permissions and YAML syntax.");
+    eprintln!("Actionable guidance: Could not read quay.yaml. Please check file permissions and YAML syntax.");
 }
         }
     } else {
         info!(
             path = %watch_root.display(),
-            "no hotreload.yaml found; continuing with defaults"
+            "no quay.yaml found; continuing with defaults"
         );
     }
 
@@ -242,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map_err(|e| error::WatchdError::Bind {
                 addr: control_addr.clone(),
                 source: e,
+                user_message: None,
             })?;
     info!(addr = %control_addr, "control interface listening");
 
@@ -249,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         port = args.port,
         "add the hot-reload client to your HTML: {}",
-        client::external_script_tag("/hotreload-client.js", args.port)
+        client::external_script_tag("/quay-client.js", args.port)
     );
 
     // Spawn server tasks.
@@ -258,9 +259,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         btx.clone(),
         cancel.clone(),
         connection_count.clone(),
-        None, // tls_cert
-        None, // tls_key
-        None, // max_connections
+        args.tls_cert.clone(), // tls_cert
+        args.tls_key.clone(),  // tls_key
+        args.max_connections,  // max_connections
     );
     control::spawn_control_server(
         ctrl_listener,
@@ -269,10 +270,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cancel.clone(),
         connection_count.clone(),
         diff_store.clone(),
-        None, // auth_token
-        None, // tls_cert
-        None, // tls_key
-        None, // max_connections
+        args.auth_token.clone(), // auth_token
+        args.tls_cert.clone(),   // tls_cert
+        args.tls_key.clone(),    // tls_key
+        args.max_connections,    // max_connections
     );
 
     // Health/readiness endpoint
@@ -283,19 +284,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(addr = %health_addr, "health endpoint listening");
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let registry = registry_clone.lock().unwrap();
             let mut buffer = Vec::new();
             let encoder = TextEncoder::new();
-            let mf = registry.gather();
-            encoder.encode(&mf, &mut buffer).unwrap();
+            {
+                let registry = registry_clone.lock().unwrap();
+                let mf = registry.gather();
+                encoder.encode(&mf, &mut buffer).unwrap();
+            }
             use tokio::io::AsyncWriteExt;
-let _ = socket.write_all(&buffer).await;
+            let _ = socket.write_all(&buffer).await;
         }
     });
 
     // Start the file-system watcher and blocking event worker.
     // We keep `_watcher` alive so that `notify` continues delivering events.
-    // The `worker_handle` is monitored by the health watchdog.
+    // The `worker_handle` is monitored by the health quayog.
     let (_watcher, worker_handle) = watcher::start(watcher::WatcherParams {
         watch_root: watch_root.into_boxed_path(),
         cmd_template,
@@ -311,10 +314,10 @@ let _ = socket.write_all(&buffer).await;
         diff_store,
     })?;
 
-    // Spawn the worker health watchdog.  If the worker thread terminates
-    // unexpectedly (panic, channel closure), the watchdog triggers a
+    // Spawn the worker health quayog.  If the worker thread terminates
+    // unexpectedly (panic, channel closure), the quayog triggers a
     // coordinated shutdown so the server doesn't run in a degraded state.
-    let _watchdog = health::WorkerWatchdog::new(worker_handle, cancel.clone()).spawn();
+    let _quayog = health::WorkerWatchdog::new(worker_handle, cancel.clone()).spawn();
 
     // Wait for Ctrl-C to initiate graceful shutdown.
     match tokio::signal::ctrl_c().await {
@@ -331,6 +334,6 @@ let _ = socket.write_all(&buffer).await;
     // Give background tasks a moment to clean up.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    info!("watchd exited");
+    info!("quay exited");
     Ok(())
 }

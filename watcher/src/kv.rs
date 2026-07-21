@@ -142,7 +142,7 @@ impl DiffStore {
         let capacity = capacity.max(1);
         let max_keys = max_keys.max(1);
         let max_file_size = max_file_size.max(1);
-        let diff_gauge = IntGauge::new("watchd_diff_count", "Total diffs in store").unwrap();
+        let diff_gauge = IntGauge::new("quay_diff_count", "Total diffs in store").unwrap();
         Self {
             diffs: HashMap::new(),
             snapshots: HashMap::new(),
@@ -201,7 +201,7 @@ impl DiffStore {
         let old_content = self.snapshots.get(path).cloned();
         let old_size = old_content.as_ref().map_or(0, Vec::len);
 
-        let (diff_text, binary) = compute_diff(old_content.as_deref(), new_content);
+        let (diff_text, binary) = compute_diff(path, old_content.as_deref(), new_content);
 
         let entry = DiffEntry {
             path: path.to_string(),
@@ -401,7 +401,7 @@ fn is_binary(data: &[u8]) -> bool {
 /// * Unchanged context lines are prefixed with `  ` (two spaces).
 /// * Binary files produce the placeholder `<binary file changed>`.
 /// * When there is no old content the entire new file is shown as additions.
-fn compute_diff(old: Option<&[u8]>, new: &[u8]) -> (String, bool) {
+fn compute_diff(path: &str, old: Option<&[u8]>, new: &[u8]) -> (String, bool) {
     let new_is_binary = is_binary(new);
     let old_is_binary = old.is_some_and(is_binary);
 
@@ -419,22 +419,11 @@ fn compute_diff(old: Option<&[u8]>, new: &[u8]) -> (String, bool) {
     }
 
     let diff = TextDiff::from_lines(&old_text, &new_text);
-    let mut output = String::new();
-
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            ChangeTag::Delete => "- ",
-            ChangeTag::Insert => "+ ",
-            ChangeTag::Equal => "  ",
-        };
-        output.push_str(sign);
-        let value = change.value();
-        output.push_str(value);
-        // Ensure every diff line ends with a newline so output is tidy.
-        if !value.ends_with('\n') {
-            output.push('\n');
-        }
-    }
+    let output = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{}", path), &format!("b/{}", path))
+        .to_string();
 
     (output, false)
 }
@@ -529,8 +518,8 @@ mod tests {
         assert_eq!(entry.new_size, 12);
         assert!(!entry.binary);
         assert!(!entry.truncated);
-        assert!(entry.diff.contains("+ line1\n"));
-        assert!(entry.diff.contains("+ line2\n"));
+        assert!(entry.diff.contains("+line1\n"));
+        assert!(entry.diff.contains("+line2\n"));
     }
 
     #[test]
@@ -539,9 +528,9 @@ mod tests {
         store.record_change("a.txt", b"alpha\nbeta\n");
         let entry = store.record_change("a.txt", b"alpha\ngamma\n").unwrap();
 
-        assert!(entry.diff.contains("- beta\n"), "diff: {}", entry.diff);
-        assert!(entry.diff.contains("+ gamma\n"), "diff: {}", entry.diff);
-        assert!(entry.diff.contains("  alpha\n"), "diff: {}", entry.diff);
+        assert!(entry.diff.contains("-beta\n"), "diff: {}", entry.diff);
+        assert!(entry.diff.contains("+gamma\n"), "diff: {}", entry.diff);
+        assert!(entry.diff.contains(" alpha\n"), "diff: {}", entry.diff);
         assert!(!entry.truncated);
     }
 
@@ -649,7 +638,7 @@ mod tests {
         let entry = store.record_change("f.txt", b"hello\n").unwrap();
         assert!(!entry.truncated);
         assert_eq!(entry.old_size, 0); // no snapshot was kept
-        assert!(entry.diff.contains("+ hello\n"));
+        assert!(entry.diff.contains("+hello\n"));
     }
 
     #[test]
@@ -717,7 +706,7 @@ mod tests {
         // Capacity is 2 so only the last two entries survive.
         assert_eq!(history.len(), 2);
         // Second entry was v1→v2, third was v2→v3.  First (initial) was evicted.
-        assert!(history[1].diff.contains("+ v3\n"));
+        assert!(history[1].diff.contains("+v3\n"));
     }
 
     #[test]
@@ -762,7 +751,7 @@ mod tests {
         store.record_change("f.txt", b"second\n");
 
         let latest = store.get_latest("f.txt").unwrap();
-        assert!(latest.diff.contains("+ second\n"));
+        assert!(latest.diff.contains("+second\n"));
     }
 
     #[test]
@@ -856,8 +845,8 @@ mod tests {
         store.seed_snapshot("f.txt", b"old line\n");
         let entry = store.record_change("f.txt", b"new line\n").unwrap();
 
-        assert!(entry.diff.contains("- old line\n"), "diff: {}", entry.diff);
-        assert!(entry.diff.contains("+ new line\n"), "diff: {}", entry.diff);
+        assert!(entry.diff.contains("-old line\n"), "diff: {}", entry.diff);
+        assert!(entry.diff.contains("+new line\n"), "diff: {}", entry.diff);
         assert_eq!(entry.old_size, 9);
     }
 
@@ -876,14 +865,14 @@ mod tests {
 
     #[test]
     fn compute_diff_no_old_content() {
-        let (diff, binary) = compute_diff(None, b"hello\n");
+        let (diff, binary) = compute_diff("test.txt", None, b"hello\n");
         assert!(!binary);
-        assert!(diff.contains("+ hello\n"));
+        assert!(diff.contains("+hello\n"));
     }
 
     #[test]
     fn compute_diff_identical_content() {
-        let (diff, binary) = compute_diff(Some(b"same\n"), b"same\n");
+        let (diff, binary) = compute_diff("test.txt", Some(b"same\n"), b"same\n");
         assert!(!binary);
         assert!(diff.is_empty());
     }
@@ -892,79 +881,79 @@ mod tests {
     fn compute_diff_addition_and_removal() {
         let old = b"aaa\nbbb\nccc\n";
         let new = b"aaa\nBBB\nccc\n";
-        let (diff, binary) = compute_diff(Some(old), new);
+        let (diff, binary) = compute_diff("test.txt", Some(old), new);
         assert!(!binary);
-        assert!(diff.contains("- bbb\n"), "diff: {diff}");
-        assert!(diff.contains("+ BBB\n"), "diff: {diff}");
-        assert!(diff.contains("  aaa\n"), "diff: {diff}");
-        assert!(diff.contains("  ccc\n"), "diff: {diff}");
+        assert!(diff.contains("-bbb\n"), "diff: {diff}");
+        assert!(diff.contains("+BBB\n"), "diff: {diff}");
+        assert!(diff.contains(" aaa\n"), "diff: {diff}");
+        assert!(diff.contains(" ccc\n"), "diff: {diff}");
     }
 
     #[test]
     fn compute_diff_binary_new() {
-        let (diff, binary) = compute_diff(Some(b"text"), b"\x00bin");
+        let (diff, binary) = compute_diff("test.txt", Some(b"text"), b"\x00bin");
         assert!(binary);
         assert_eq!(diff, "<binary file changed>");
     }
 
     #[test]
     fn compute_diff_binary_old() {
-        let (diff, binary) = compute_diff(Some(b"\x00bin"), b"text");
+        let (diff, binary) = compute_diff("test.txt", Some(b"\x00bin"), b"text");
         assert!(binary);
         assert_eq!(diff, "<binary file changed>");
     }
 
     #[test]
     fn compute_diff_both_binary() {
-        let (diff, binary) = compute_diff(Some(b"\x00old"), b"\x00new");
+        let (diff, binary) = compute_diff("test.txt", Some(b"\x00old"), b"\x00new");
         assert!(binary);
         assert_eq!(diff, "<binary file changed>");
     }
 
     #[test]
     fn compute_diff_empty_to_content() {
-        let (diff, binary) = compute_diff(Some(b""), b"new\n");
+        let (diff, binary) = compute_diff("test.txt", Some(b""), b"new\n");
         assert!(!binary);
-        assert!(diff.contains("+ new\n"));
+        assert!(diff.contains("+new\n"));
     }
 
     #[test]
     fn compute_diff_content_to_empty() {
-        let (diff, binary) = compute_diff(Some(b"old\n"), b"");
+        let (diff, binary) = compute_diff("test.txt", Some(b"old\n"), b"");
         assert!(!binary);
-        assert!(diff.contains("- old\n"));
+        assert!(diff.contains("-old\n"));
     }
 
     #[test]
     fn compute_diff_multiline_additions() {
         let old = b"line1\n";
         let new = b"line1\nline2\nline3\n";
-        let (diff, binary) = compute_diff(Some(old), new);
+        let (diff, binary) = compute_diff("test.txt", Some(old), new);
         assert!(!binary);
-        assert!(diff.contains("  line1\n"), "diff: {diff}");
-        assert!(diff.contains("+ line2\n"), "diff: {diff}");
-        assert!(diff.contains("+ line3\n"), "diff: {diff}");
+        assert!(diff.contains(" line1\n"), "diff: {diff}");
+        assert!(diff.contains("+line2\n"), "diff: {diff}");
+        assert!(diff.contains("+line3\n"), "diff: {diff}");
     }
 
     #[test]
     fn compute_diff_multiline_removals() {
         let old = b"line1\nline2\nline3\n";
         let new = b"line1\n";
-        let (diff, binary) = compute_diff(Some(old), new);
+        let (diff, binary) = compute_diff("test.txt", Some(old), new);
         assert!(!binary);
-        assert!(diff.contains("  line1\n"), "diff: {diff}");
-        assert!(diff.contains("- line2\n"), "diff: {diff}");
-        assert!(diff.contains("- line3\n"), "diff: {diff}");
+        assert!(diff.contains(" line1\n"), "diff: {diff}");
+        assert!(diff.contains("-line2\n"), "diff: {diff}");
+        assert!(diff.contains("-line3\n"), "diff: {diff}");
     }
 
     #[test]
     fn compute_diff_no_trailing_newline_handled() {
         let old = b"no newline";
         let new = b"no newline here either";
-        let (diff, _) = compute_diff(Some(old), new);
+        let (diff, _) = compute_diff("test.txt", Some(old), new);
         // Should still produce valid output with newlines appended.
-        assert!(diff.contains("- no newline\n"), "diff: {diff}");
-        assert!(diff.contains("+ no newline here either\n"), "diff: {diff}");
+        assert!(diff.contains("-no newline\n"), "diff: {diff}");
+        assert!(diff.contains("+no newline here either\n"), "diff: {diff}");
     }
 
     // -- is_binary ---------------------------------------------------------
@@ -1017,7 +1006,7 @@ mod tests {
         let entry = DiffEntry {
             path: "src/main.rs".to_string(),
             timestamp: SystemTime::UNIX_EPOCH,
-            diff: "+ added\n".to_string(),
+            diff: "+added\n".to_string(),
             old_size: 10,
             new_size: 20,
             binary: false,
@@ -1026,7 +1015,7 @@ mod tests {
         let json = entry.to_json();
         assert_eq!(json["path"], "src/main.rs");
         assert_eq!(json["timestamp"], 0);
-        assert_eq!(json["diff"], "+ added\n");
+        assert_eq!(json["diff"], "+added\n");
         assert_eq!(json["old_size"], 10);
         assert_eq!(json["new_size"], 20);
         assert_eq!(json["binary"], false);
@@ -1157,7 +1146,7 @@ mod tests {
 
         let history = store.get_history("f.txt");
         assert_eq!(history.len(), 1);
-        assert!(history[0].diff.contains("+ v3\n") || history[0].diff.contains("- v2\n"));
+        assert!(history[0].diff.contains("+v3\n") || history[0].diff.contains("-v2\n"));
     }
 
     #[test]
@@ -1209,7 +1198,7 @@ mod tests {
         store.clear();
         let entry = store.record_change("a.txt", b"v2\n").unwrap();
         // No previous snapshot after clear, so entire file is additions.
-        assert!(entry.diff.contains("+ v2\n"));
+        assert!(entry.diff.contains("+v2\n"));
         assert_eq!(entry.old_size, 0);
     }
 
@@ -1221,7 +1210,7 @@ mod tests {
         let entry = store.record_change("a.txt", b"v2\n").unwrap();
         // Snapshot was removed, so old_size is 0 and diff shows full additions.
         assert_eq!(entry.old_size, 0);
-        assert!(entry.diff.contains("+ v2\n"));
+        assert!(entry.diff.contains("+v2\n"));
     }
 
     // -- DiffEntry Clone ---------------------------------------------------
@@ -1231,7 +1220,7 @@ mod tests {
         let entry = DiffEntry {
             path: "p.txt".to_string(),
             timestamp: SystemTime::now(),
-            diff: "+ line\n".to_string(),
+            diff: "+line\n".to_string(),
             old_size: 5,
             new_size: 10,
             binary: false,
@@ -1258,7 +1247,7 @@ mod tests {
         let mut store = make_store(5, 10);
         let entry = store.record_change_from_disk("test.txt", &file).unwrap();
         assert_eq!(entry.new_size, 6);
-        assert!(entry.diff.contains("+ hello\n"));
+        assert!(entry.diff.contains("+hello\n"));
         assert!(!entry.truncated);
 
         // Clean up.
@@ -1301,7 +1290,7 @@ mod tests {
 
         for line in entry.diff.lines() {
             assert!(
-                line.starts_with("+ ") || line.starts_with("- ") || line.starts_with("  "),
+                line.starts_with("+") || line.starts_with("-") || line.starts_with(" ") || line.starts_with("@"),
                 "unexpected line prefix: {:?}",
                 line
             );
@@ -1314,7 +1303,7 @@ mod tests {
         store.record_change("f.txt", b"ctx\nold\n");
         let entry = store.record_change("f.txt", b"ctx\nnew\n").unwrap();
 
-        let context_lines: Vec<_> = entry.diff.lines().filter(|l| l.starts_with("  ")).collect();
+        let context_lines: Vec<_> = entry.diff.lines().filter(|l| l.starts_with(" ")).collect();
         assert!(!context_lines.is_empty(), "should have context lines");
         assert!(context_lines[0].contains("ctx"));
     }

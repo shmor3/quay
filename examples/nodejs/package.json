@@ -1,14 +1,14 @@
 {
-  "name": "hotreload-client-nodejs",
+  "name": "quay-client-nodejs",
   "version": "1.0.0",
-  "description": "watchd hot-reload client for Node.js — connects to a watchd WebSocket server and reacts to file-change notifications.",
-  "main": "hotreload-client.js",
+  "description": "quay hot-reload client for Node.js — connects to a quay WebSocket server and reacts to file-change notifications.",
+  "main": "quay-client.js",
   "scripts": {
-    "start": "node hotreload-client.js"
+    "start": "node quay-client.js"
   },
   "keywords": [
-    "hotreload",
-    "watchd",
+    "quay",
+    "quay",
     "websocket",
     "livereload",
     "file-watcher"

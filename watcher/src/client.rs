@@ -1,6 +1,6 @@
-//! Embedded browser client for `watchd`.
+//! Embedded browser client for `quay`.
 //!
-//! Contains a self-contained JavaScript snippet that connects to the watchd
+//! Contains a self-contained JavaScript snippet that connects to the quay
 //! WebSocket server and handles `reload` and `inject-css` messages.  The
 //! snippet is designed to be dropped into any HTML page via a `<script>` tag.
 //!
@@ -10,11 +10,11 @@
 //! - Reconnects automatically with exponential backoff (1 s → 30 s cap)
 //! - Handles `reload` messages by calling `location.reload()`
 //! - Handles `inject-css` messages by decoding base64 content and
-//!   inserting/updating a `<style data-hotreload="<path>">` element
+//!   inserting/updating a `<style data-quay="<path>">` element
 //! - Logs connection lifecycle events to the browser console
 //! - Zero external dependencies — pure vanilla JS
 
-/// The default WebSocket port used by watchd.
+/// The default WebSocket port used by quay.
 pub const DEFAULT_WS_PORT: u16 = 3012;
 
 /// Minified JavaScript client that can be embedded directly in a `<script>`
@@ -24,7 +24,7 @@ pub const DEFAULT_WS_PORT: u16 = 3012;
 /// element to allow overriding the default port:
 ///
 /// ```html
-/// <script src="/hotreload-client.js" data-port="4000"></script>
+/// <script src="/quay-client.js" data-port="4000"></script>
 /// ```
 pub const CLIENT_JS: &str = r#"(function(){
   "use strict";
@@ -42,11 +42,11 @@ pub const CLIENT_JS: &str = r#"(function(){
   var reconnectTimer = null;
 
   function log(msg) {
-    console.log("%c[hotreload]%c " + msg, "color:#e06c75;font-weight:bold", "color:inherit");
+    console.log("%c[quay]%c " + msg, "color:#e06c75;font-weight:bold", "color:inherit");
   }
 
   function warn(msg) {
-    console.warn("[hotreload] " + msg);
+    console.warn("[quay] " + msg);
   }
 
   // Base64 decode that works in all browsers.
@@ -61,13 +61,13 @@ pub const CLIENT_JS: &str = r#"(function(){
 
   function injectCSS(path, encodedContent) {
     var css = b64decode(encodedContent);
-    var existing = document.querySelector('style[data-hotreload="' + CSS.escape(path) + '"]');
+    var existing = document.querySelector('style[data-quay="' + CSS.escape(path) + '"]');
     if (existing) {
       existing.textContent = css;
       log("injected CSS update for " + path);
     } else {
       var style = document.createElement("style");
-      style.setAttribute("data-hotreload", path);
+      style.setAttribute("data-quay", path);
       style.textContent = css;
       document.head.appendChild(style);
       log("injected new CSS for " + path);
@@ -194,7 +194,7 @@ pub fn snippet_help(port: u16) -> String {
 
     help.push_str("Option 2 — external script tag (if you serve the JS file yourself):\n\n");
     help.push_str("  ");
-    help.push_str(&external_script_tag("/hotreload-client.js", port));
+    help.push_str(&external_script_tag("/quay-client.js", port));
     help.push('\n');
 
     help
@@ -209,6 +209,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn client_js_is_valid_string() {
         // Ensure the embedded JS is non-empty and starts with an IIFE.
         assert!(!CLIENT_JS.is_empty());
@@ -221,7 +222,7 @@ mod tests {
         assert!(CLIENT_JS.contains("\"reload\""));
         assert!(CLIENT_JS.contains("\"inject-css\""));
         assert!(CLIENT_JS.contains("location.reload()"));
-        assert!(CLIENT_JS.contains("data-hotreload"));
+        assert!(CLIENT_JS.contains("data-quay"));
         assert!(CLIENT_JS.contains("WebSocket"));
     }
 
@@ -242,16 +243,16 @@ mod tests {
 
     #[test]
     fn external_script_tag_default_port() {
-        let tag = external_script_tag("/hotreload-client.js", DEFAULT_WS_PORT);
-        assert_eq!(tag, r#"<script src="/hotreload-client.js"></script>"#);
+        let tag = external_script_tag("/quay-client.js", DEFAULT_WS_PORT);
+        assert_eq!(tag, r#"<script src="/quay-client.js"></script>"#);
     }
 
     #[test]
     fn external_script_tag_custom_port() {
-        let tag = external_script_tag("/hotreload-client.js", 5000);
+        let tag = external_script_tag("/quay-client.js", 5000);
         assert_eq!(
             tag,
-            r#"<script src="/hotreload-client.js" data-port="5000"></script>"#
+            r#"<script src="/quay-client.js" data-port="5000"></script>"#
         );
     }
 
@@ -327,7 +328,7 @@ mod tests {
     #[test]
     fn client_js_has_css_injection() {
         assert!(CLIENT_JS.contains("injectCSS"));
-        assert!(CLIENT_JS.contains("data-hotreload"));
+        assert!(CLIENT_JS.contains("data-quay"));
         assert!(CLIENT_JS.contains("createElement"));
         assert!(CLIENT_JS.contains("textContent"));
     }
@@ -338,14 +339,14 @@ mod tests {
         // examples/javascript has full cache-busting.  The embedded version
         // does reference linked stylesheets via CSS.escape for selector safety.
         assert!(CLIENT_JS.contains("CSS.escape"));
-        assert!(CLIENT_JS.contains("data-hotreload"));
+        assert!(CLIENT_JS.contains("data-quay"));
     }
 
     #[test]
     fn client_js_has_console_logging() {
         assert!(CLIENT_JS.contains("console.log"));
         assert!(CLIENT_JS.contains("console.warn"));
-        assert!(CLIENT_JS.contains("[hotreload]"));
+        assert!(CLIENT_JS.contains("[quay]"));
     }
 
     #[test]
@@ -437,26 +438,26 @@ mod tests {
 
     #[test]
     fn external_script_tag_absolute_url() {
-        let tag = external_script_tag("https://cdn.example.com/hotreload.js", DEFAULT_WS_PORT);
+        let tag = external_script_tag("https://cdn.example.com/quay.js", DEFAULT_WS_PORT);
         assert_eq!(
             tag,
-            r#"<script src="https://cdn.example.com/hotreload.js"></script>"#
+            r#"<script src="https://cdn.example.com/quay.js"></script>"#
         );
     }
 
     #[test]
     fn external_script_tag_absolute_url_with_custom_port() {
-        let tag = external_script_tag("https://cdn.example.com/hotreload.js", 9999);
+        let tag = external_script_tag("https://cdn.example.com/quay.js", 9999);
         assert_eq!(
             tag,
-            r#"<script src="https://cdn.example.com/hotreload.js" data-port="9999"></script>"#
+            r#"<script src="https://cdn.example.com/quay.js" data-port="9999"></script>"#
         );
     }
 
     #[test]
     fn external_script_tag_relative_path() {
-        let tag = external_script_tag("./assets/hotreload.js", DEFAULT_WS_PORT);
-        assert_eq!(tag, r#"<script src="./assets/hotreload.js"></script>"#);
+        let tag = external_script_tag("./assets/quay.js", DEFAULT_WS_PORT);
+        assert_eq!(tag, r#"<script src="./assets/quay.js"></script>"#);
     }
 
     #[test]
@@ -479,16 +480,16 @@ mod tests {
 
     #[test]
     fn external_script_tag_src_with_query_params() {
-        let tag = external_script_tag("/hotreload.js?v=2", DEFAULT_WS_PORT);
-        assert_eq!(tag, r#"<script src="/hotreload.js?v=2"></script>"#);
+        let tag = external_script_tag("/quay.js?v=2", DEFAULT_WS_PORT);
+        assert_eq!(tag, r#"<script src="/quay.js?v=2"></script>"#);
     }
 
     #[test]
     fn external_script_tag_src_with_query_and_custom_port() {
-        let tag = external_script_tag("/hotreload.js?v=2", 8080);
+        let tag = external_script_tag("/quay.js?v=2", 8080);
         assert_eq!(
             tag,
-            r#"<script src="/hotreload.js?v=2" data-port="8080"></script>"#
+            r#"<script src="/quay.js?v=2" data-port="8080"></script>"#
         );
     }
 
@@ -521,7 +522,7 @@ mod tests {
         assert!(help.contains("external script"));
         assert!(help.contains("<script>"));
         assert!(help.contains("</script>"));
-        assert!(help.contains("/hotreload-client.js"));
+        assert!(help.contains("/quay-client.js"));
     }
 
     #[test]
@@ -543,7 +544,7 @@ mod tests {
         // a data-port attribute.  Note: the inline JS body itself contains
         // the string "data-port" as part of getAttribute("data-port"), so
         // we check the external tag line specifically.
-        let external = external_script_tag("/hotreload-client.js", DEFAULT_WS_PORT);
+        let external = external_script_tag("/quay-client.js", DEFAULT_WS_PORT);
         assert!(
             !external.contains("data-port"),
             "external tag at default port should not include data-port"
@@ -596,7 +597,7 @@ mod tests {
     #[test]
     fn all_port_functions_consistent_at_default() {
         let inline = inline_script_tag(DEFAULT_WS_PORT);
-        let external = external_script_tag("/hotreload-client.js", DEFAULT_WS_PORT);
+        let external = external_script_tag("/quay-client.js", DEFAULT_WS_PORT);
         let help = snippet_help(DEFAULT_WS_PORT);
 
         // At default port: inline uses 3012, external has no data-port.
@@ -613,7 +614,7 @@ mod tests {
     fn all_port_functions_consistent_at_custom() {
         let port: u16 = 9876;
         let inline = inline_script_tag(port);
-        let external = external_script_tag("/hotreload-client.js", port);
+        let external = external_script_tag("/quay-client.js", port);
         let help = snippet_help(port);
 
         assert!(inline.contains("var DEFAULT_PORT = 9876;"));

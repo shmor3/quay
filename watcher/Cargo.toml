@@ -1,5 +1,5 @@
 [package]
-name = "hotreload-watcher"
+name = "quay"
 version = "0.2.0"
 edition = "2021"
 description = "A minimal, language-agnostic file watcher that runs commands on changes and broadcasts reload/CSS-inject messages to browser clients via WebSocket."
@@ -25,5 +25,5 @@ similar = "2.6"
 prometheus = "0.13"
 
 [[bin]]
-name = "watchd"
+name = "quay"
 path = "src/main.rs"

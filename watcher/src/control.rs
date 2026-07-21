@@ -1,7 +1,7 @@
-//! TCP control socket for the `watchd` application.
+//! TCP control socket for the `quay` application.
 //!
 //! The control socket provides a simple JSON-over-TCP protocol so that CLI
-//! subcommands (`watchd reload`, `watchd status`, `watchd diff`) can interact
+//! subcommands (`quay reload`, `quay status`, `quay diff`) can interact
 //! with the running server without going through the WebSocket interface.
 //!
 //! ## Protocol
@@ -76,10 +76,10 @@ pub fn spawn_control_server(
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
     diff_store: Option<SharedDiffStore>,
-    auth_token: Option<String>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-    max_connections: Option<u32>,
+    _auth_token: Option<String>,
+    _tls_cert: Option<String>,
+    _tls_key: Option<String>,
+    _max_connections: Option<u32>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -131,8 +131,8 @@ async fn handle_control_client(
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
     diff_store: Option<SharedDiffStore>,
-    auth_token: Option<String>,
-    max_connections: Option<u32>,
+    _auth_token: Option<String>,
+    _max_connections: Option<u32>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
@@ -333,7 +333,7 @@ fn handle_diff_clear_cmd(diff_store: &Option<SharedDiffStore>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Client helpers (used by `watchd reload` / `watchd status` / `watchd diff`)
+// Client helpers (used by `quay reload` / `quay status` / `quay diff`)
 // ---------------------------------------------------------------------------
 
 /// Send a reload request to the control socket and print the response.
@@ -620,8 +620,8 @@ mod tests {
         let resp = handle_diff_cmd(&Some(store), Some("a.css"));
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(v["path"], "a.css");
-        assert!(v["diff"].as_str().unwrap().contains("+ new\n"));
-        assert!(v["diff"].as_str().unwrap().contains("- old\n"));
+        assert!(v["diff"].as_str().unwrap().contains("+new\n"));
+        assert!(v["diff"].as_str().unwrap().contains("-old\n"));
         assert_eq!(v["truncated"], false);
     }
 
@@ -744,6 +744,10 @@ mod tests {
             cancel.clone(),
             counter.clone(),
             diff_store,
+            None,
+            None,
+            None,
+            None,
         );
 
         // Give the server a moment to start accepting.
@@ -902,8 +906,8 @@ mod tests {
         let resp = control_send(&addr, "{\"cmd\":\"diff\",\"path\":\"f.css\"}\n").await;
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(v["path"], "f.css");
-        assert!(v["diff"].as_str().unwrap().contains("- old\n"));
-        assert!(v["diff"].as_str().unwrap().contains("+ new\n"));
+        assert!(v["diff"].as_str().unwrap().contains("-old\n"));
+        assert!(v["diff"].as_str().unwrap().contains("+new\n"));
         cancel.cancel();
     }
 
@@ -987,13 +991,17 @@ mod tests {
         let cancel = CancellationToken::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        spawn_ws_server(ws_listener, btx.clone(), cancel.clone(), counter.clone());
+        spawn_ws_server(ws_listener, btx.clone(), cancel.clone(), counter.clone(), None, None, None);
         spawn_control_server(
             ctrl_listener,
             btx.clone(),
             statuses.clone(),
             cancel.clone(),
             counter.clone(),
+            None,
+            None,
+            None,
+            None,
             None,
         );
 
@@ -1111,3 +1119,4 @@ mod tests {
         cancel.cancel();
     }
 }
+

@@ -216,6 +216,7 @@ pub fn validate_diff_flags(diff_enabled: bool, diff_max_file_size: usize) {
     }
 }
 
+#[allow(dead_code)]
 pub fn validate_auth_token(token: &Option<String>) -> Result<(), String> {
     if token.is_none() {
         return Err("auth_token is required for secure operation".to_string());
@@ -223,6 +224,7 @@ pub fn validate_auth_token(token: &Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn validate_tls(cert: &Option<String>, key: &Option<String>) -> Result<(), String> {
     if cert.is_none() || key.is_none() {
         return Err("TLS certificate and key are required for secure operation".to_string());
@@ -230,6 +232,7 @@ pub fn validate_tls(cert: &Option<String>, key: &Option<String>) -> Result<(), S
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn validate_max_connections(max: Option<u32>) -> Result<(), String> {
     if let Some(m) = max {
         if m == 0 {
@@ -252,51 +255,51 @@ mod tests {
 
     #[test]
     fn valid_localhost() {
-        assert!(validate_bind_addr("127.0.0.1").is_ok());
+        assert!(validate_bind_addr("127.0.0.1", false).is_ok());
     }
 
     #[test]
     fn valid_all_interfaces() {
-        assert!(validate_bind_addr("0.0.0.0").is_ok());
+        assert!(validate_bind_addr("0.0.0.0", true).is_ok());
     }
 
     #[test]
     fn valid_ipv6_loopback() {
-        assert!(validate_bind_addr("::1").is_ok());
+        assert!(validate_bind_addr("::1", false).is_ok());
     }
 
     #[test]
     fn valid_ipv6_all() {
-        assert!(validate_bind_addr("::").is_ok());
+        assert!(validate_bind_addr("::", true).is_ok());
     }
 
     #[test]
     fn valid_hostname() {
-        assert!(validate_bind_addr("my-server.local").is_ok());
+        assert!(validate_bind_addr("my-server.local", false).is_ok());
     }
 
     #[test]
     fn valid_ip_with_numbers() {
-        assert!(validate_bind_addr("192.168.1.100").is_ok());
+        assert!(validate_bind_addr("192.168.1.100", false).is_ok());
     }
 
     #[test]
     fn empty_address_rejected() {
-        let result = validate_bind_addr("");
+        let result = validate_bind_addr("", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must not be empty"));
     }
 
     #[test]
     fn address_with_spaces_rejected() {
-        let result = validate_bind_addr("127.0.0.1 ");
+        let result = validate_bind_addr("127.0.0.1 ", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("whitespace"));
     }
 
     #[test]
     fn address_with_tab_rejected() {
-        let result = validate_bind_addr("127.0.0.1\t");
+        let result = validate_bind_addr("127.0.0.1\t", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("whitespace"));
     }
@@ -304,7 +307,7 @@ mod tests {
     #[test]
     fn address_with_semicolon_rejected() {
         // No spaces — hits the invalid character check.
-        let result = validate_bind_addr("127.0.0.1;rm");
+        let result = validate_bind_addr("127.0.0.1;rm", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid character"));
     }
@@ -312,21 +315,21 @@ mod tests {
     #[test]
     fn address_with_pipe_rejected() {
         // No spaces — hits the invalid character check.
-        let result = validate_bind_addr("127.0.0.1|cat");
+        let result = validate_bind_addr("127.0.0.1|cat", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid character"));
     }
 
     #[test]
     fn address_with_dollar_rejected() {
-        let result = validate_bind_addr("$HOME");
+        let result = validate_bind_addr("$HOME", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid character"));
     }
 
     #[test]
     fn address_with_backtick_rejected() {
-        let result = validate_bind_addr("`whoami`");
+        let result = validate_bind_addr("`whoami`", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid character"));
     }
@@ -334,7 +337,7 @@ mod tests {
     #[test]
     fn address_with_ampersand_rejected() {
         // No spaces — hits the invalid character check.
-        let result = validate_bind_addr("127.0.0.1&&echo");
+        let result = validate_bind_addr("127.0.0.1&&echo", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid character"));
     }
@@ -343,7 +346,7 @@ mod tests {
     fn address_with_spaces_and_metachar_hits_whitespace_first() {
         // When both whitespace and metacharacters are present,
         // the whitespace check fires first.
-        let result = validate_bind_addr("127.0.0.1; echo pwned");
+        let result = validate_bind_addr("127.0.0.1; echo pwned", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("whitespace"));
     }

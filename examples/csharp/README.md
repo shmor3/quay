@@ -1,6 +1,6 @@
-# watchd Hot-Reload Client — C# / .NET
+# quay Hot-Reload Client — C# / .NET
 
-A WebSocket client that connects to a running `watchd` server and reacts to
+A WebSocket client that connects to a running `quay` server and reacts to
 `reload` and `inject-css` messages. Built on `System.Net.WebSockets` with zero
 external dependencies beyond the .NET BCL.
 
@@ -30,14 +30,14 @@ dotnet run -- localhost 4000
 
 ## Usage as a Library
 
-Copy `HotreloadClient.cs` into your project and use the `HotreloadClient` class
+Copy `QuayClient.cs` into your project and use the `QuayClient` class
 directly:
 
 ```csharp
-using Hotreload;
+using Quay;
 
 using var cts = new CancellationTokenSource();
-using var client = new HotreloadClient("localhost", 3012);
+using var client = new QuayClient("localhost", 3012);
 
 client.OnReload += (_, e) =>
 {
@@ -56,27 +56,27 @@ await client.RunAsync(cts.Token);
 
 ## API Reference
 
-### `HotreloadClient(string host, int port)`
+### `QuayClient(string host, int port)`
 
-Create a new client targeting the specified watchd server.
+Create a new client targeting the specified quay server.
 
 | Parameter | Default       | Description                       |
 |-----------|---------------|-----------------------------------|
-| `host`    | `"localhost"` | Hostname or IP of the watchd server |
+| `host`    | `"localhost"` | Hostname or IP of the quay server |
 | `port`    | `3012`        | WebSocket port                    |
 
 ### Events
 
 | Event            | Args                  | Description                                  |
 |------------------|-----------------------|----------------------------------------------|
-| `OnReload`       | `HotreloadEventArgs`  | Fired on `reload` messages                   |
-| `OnInjectCss`    | `HotreloadEventArgs`  | Fired on `inject-css` messages               |
-| `OnMessage`      | `HotreloadEventArgs`  | Fired on any message (including unknown types)|
+| `OnReload`       | `QuayEventArgs`  | Fired on `reload` messages                   |
+| `OnInjectCss`    | `QuayEventArgs`  | Fired on `inject-css` messages               |
+| `OnMessage`      | `QuayEventArgs`  | Fired on any message (including unknown types)|
 | `OnConnected`    | `EventArgs`           | Fired when the WebSocket connection opens    |
 | `OnDisconnected` | `EventArgs`           | Fired when the connection is lost            |
 | `OnError`        | `Exception`           | Fired when a connection error occurs         |
 
-### `HotreloadEventArgs`
+### `QuayEventArgs`
 
 | Property     | Type      | Description                                    |
 |--------------|-----------|------------------------------------------------|

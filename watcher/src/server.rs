@@ -1,4 +1,4 @@
-//! WebSocket server and shared status-map infrastructure for `watchd`.
+//! WebSocket server and shared status-map infrastructure for `quay`.
 //!
 //! This module owns the WebSocket accept loop that forwards broadcast messages
 //! (reload / inject-css) to all connected browser clients.  It also provides
@@ -81,11 +81,11 @@ pub fn spawn_ws_server(
     btx: broadcast::Sender<String>,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-    max_connections: Option<u32>,
+    _tls_cert: Option<String>,
+    _tls_key: Option<String>,
+    _max_connections: Option<u32>,
 ) {
-    let ws_gauge = IntGauge::new("watchd_ws_connections", "WebSocket connections").unwrap();
+    let ws_gauge = IntGauge::new("quay_ws_connections", "WebSocket connections").unwrap();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -136,7 +136,7 @@ async fn handle_ws_client(
     btx: broadcast::Sender<String>,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
-    max_connections: Option<u32>,
+    _max_connections: Option<u32>,
 ) {
     // Apply a timeout to the WebSocket handshake so that a client that opens a
     // raw TCP connection but never sends the HTTP Upgrade request cannot hold
@@ -318,7 +318,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        spawn_ws_server(listener, btx.clone(), cancel.clone(), counter.clone());
+        spawn_ws_server(listener, btx.clone(), cancel.clone(), counter.clone(), None, None, None);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -529,3 +529,4 @@ mod tests {
         }
     }
 }
+

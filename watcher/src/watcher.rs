@@ -12,7 +12,7 @@
 //!   access events are ignored.
 //! - **Command timeout** – an optional per-invocation timeout prevents stuck
 //!   build commands from blocking the worker indefinitely.
-//! - **Config hot-reload** – when `hotreload.yaml` itself is modified the
+//! - **Config hot-reload** – when `quay.yaml` itself is modified the
 //!   worker reloads its config entries automatically without a restart.
 //! - **Worker resilience** – the worker thread catches panics and logs them
 //!   rather than crashing silently, and tracks event-processing statistics
@@ -249,7 +249,7 @@ fn broadcast_inject_css(
 // Config hot-reload
 // ---------------------------------------------------------------------------
 
-/// Attempt to reload `hotreload.yaml` from `config_path`.
+/// Attempt to reload `quay.yaml` from `config_path`.
 ///
 /// Returns `Some(new_configs)` on success, or `None` if reading / parsing
 /// fails (errors are logged internally).
@@ -299,7 +299,7 @@ struct WorkerContext {
     cmd_template: String,
     debouncer: Debouncer,
     cmd_timeout: Option<Duration>,
-    /// Absolute path to `hotreload.yaml` (used for config hot-reload detection).
+    /// Absolute path to `quay.yaml` (used for config hot-reload detection).
     config_path: Box<Path>,
     /// Optional diff store for recording file change diffs.
     diff_store: Option<SharedDiffStore>,
@@ -391,7 +391,7 @@ impl WorkerContext {
 
         // Detect config file change → hot-reload.
         if path == self.config_path.as_ref() {
-            info!("hotreload.yaml changed; reloading configs");
+            info!("quay.yaml changed; reloading configs");
             if let Some(new_configs) = try_reload_configs(&self.config_path) {
                 // Update the status map: remove old entries, add new ones.
                 if let Ok(mut guard) = self.statuses.lock() {
@@ -434,7 +434,7 @@ impl WorkerContext {
             // Run on_change / build command if configured.
             if let Some(cmd) = cfg.command_for(&normalized) {
                 info!(config = %cfg.name, cmd = %cmd, "running command");
-                run_command_blocking(&cmd, self.cmd_timeout);
+                run_command_blocking(&cmd, self.cmd_timeout, None, None);
             }
 
             // Notify browser clients.
@@ -471,7 +471,7 @@ impl WorkerContext {
             .cmd_template
             .replace("{path}", &shell_escape(&normalized));
         info!(cmd = %cmd, "running fallback command");
-        run_command_blocking(&cmd, self.cmd_timeout);
+        run_command_blocking(&cmd, self.cmd_timeout, None, None);
         broadcast_reload(&self.btx, &normalized, "default");
     }
 }
@@ -485,7 +485,7 @@ impl WorkerContext {
 /// This function:
 /// 1. Creates a `notify` [`RecommendedWatcher`] watching `watch_root` recursively.
 /// 2. Optionally runs the startup command (unless `skip_initial_run` is true).
-/// 3. Spawns a background **OS thread** (named `watchd-worker`) that processes
+/// 3. Spawns a background **OS thread** (named `quay-worker`) that processes
 ///    events in a tight loop with debouncing.
 ///
 /// The returned tuple contains:
@@ -529,9 +529,9 @@ pub fn start(
     // Resolve the config file path for hot-reload detection.
     // Canonicalize so it matches the absolute paths reported by `notify`.
     let config_path = watch_root
-        .join("hotreload.yaml")
+        .join("quay.yaml")
         .canonicalize()
-        .unwrap_or_else(|_| watch_root.join("hotreload.yaml"))
+        .unwrap_or_else(|_| watch_root.join("quay.yaml"))
         .into_boxed_path();
 
     // Optionally run the startup command.
@@ -558,7 +558,7 @@ pub fn start(
         diff_store,
     };
     let worker_handle = std::thread::Builder::new()
-        .name("watchd-worker".to_string())
+        .name("quay-worker".to_string())
         .spawn(move || ctx.run())
         .map_err(notify::Error::io)?;
 
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn broadcast_inject_css_with_real_file() {
         // Create a real temp CSS file and verify inject-css broadcast.
-        let dir = std::env::temp_dir().join("watchd_test_inject_css");
+        let dir = std::env::temp_dir().join("quay_test_inject_css");
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("style.css");
         std::fs::write(&css_path, "body { color: red; }").unwrap();
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn broadcast_inject_css_empty_file() {
-        let dir = std::env::temp_dir().join("watchd_test_inject_empty");
+        let dir = std::env::temp_dir().join("quay_test_inject_empty");
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("empty.css");
         std::fs::write(&css_path, "").unwrap();
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     fn broadcast_inject_css_large_file() {
-        let dir = std::env::temp_dir().join("watchd_test_inject_large");
+        let dir = std::env::temp_dir().join("quay_test_inject_large");
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("large.css");
         // 100KB of CSS content.
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[test]
     fn broadcast_inject_css_utf8_content() {
-        let dir = std::env::temp_dir().join("watchd_test_inject_utf8");
+        let dir = std::env::temp_dir().join("quay_test_inject_utf8");
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("unicode.css");
         let css = "/* 日本語コメント */ body { content: '🎨'; }";
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[test]
     fn notify_clients_inject_css_mode_with_real_file() {
-        let dir = std::env::temp_dir().join("watchd_test_notify_inject");
+        let dir = std::env::temp_dir().join("quay_test_notify_inject");
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("notify.css");
         std::fs::write(&css_path, ".x { color: blue; }").unwrap();
@@ -1237,9 +1237,9 @@ mod tests {
 
     #[test]
     fn try_reload_configs_valid_file() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_valid");
+        let dir = std::env::temp_dir().join("quay_test_reload_valid");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(
             &cfg_path,
             r#"
@@ -1268,16 +1268,16 @@ mod tests {
 
     #[test]
     fn try_reload_configs_nonexistent_file() {
-        let path = Path::new("/nonexistent/hotreload.yaml");
+        let path = Path::new("/nonexistent/quay.yaml");
         let result = try_reload_configs(path);
         assert!(result.is_none());
     }
 
     #[test]
     fn try_reload_configs_empty_file() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_empty");
+        let dir = std::env::temp_dir().join("quay_test_reload_empty");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(&cfg_path, "").unwrap();
 
         // Empty YAML produces zero configs → returns None (keeps previous).
@@ -1289,9 +1289,9 @@ mod tests {
 
     #[test]
     fn try_reload_configs_invalid_yaml() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_invalid");
+        let dir = std::env::temp_dir().join("quay_test_reload_invalid");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(&cfg_path, "{{{{not valid yaml at all}}}}").unwrap();
 
         let result = try_reload_configs(&cfg_path);
@@ -1302,9 +1302,9 @@ mod tests {
 
     #[test]
     fn try_reload_configs_single_config() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_single");
+        let dir = std::env::temp_dir().join("quay_test_reload_single");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(
             &cfg_path,
             "name: solo\nwatch: \"**/*.rs\"\non_change: \"cargo build\"\n",
@@ -1324,9 +1324,9 @@ mod tests {
 
     #[test]
     fn try_reload_configs_scalar_yaml() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_scalar");
+        let dir = std::env::temp_dir().join("quay_test_reload_scalar");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(&cfg_path, "42\n").unwrap();
 
         // Scalar YAML produces zero configs → None.
@@ -1346,9 +1346,9 @@ mod tests {
         let (btx, _) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_exit");
+        let dir = std::env::temp_dir().join("quay_test_worker_exit");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1380,9 +1380,9 @@ mod tests {
         let (btx, _) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_errors");
+        let dir = std::env::temp_dir().join("quay_test_worker_errors");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1421,9 +1421,9 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_irrelevant");
+        let dir = std::env::temp_dir().join("quay_test_worker_irrelevant");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1466,14 +1466,14 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_relevant");
+        let dir = std::env::temp_dir().join("quay_test_worker_relevant");
         let _ = std::fs::create_dir_all(&dir);
 
         // Create a real HTML file so the handler produces a reload broadcast.
         let html_path = dir.join("page.html");
         std::fs::write(&html_path, "<html></html>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1519,7 +1519,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(vec!["styles".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_css_cfg");
+        let dir = std::env::temp_dir().join("quay_test_worker_css_cfg");
         let _ = std::fs::create_dir_all(&dir);
 
         let css_path = dir.join("app.css");
@@ -1537,7 +1537,7 @@ mod tests {
         };
         cfg.compile_watch_set();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1581,9 +1581,9 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_filtered");
+        let dir = std::env::temp_dir().join("quay_test_worker_filtered");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         // Filter that excludes everything in a "tmp" directory.
         let filter = PathFilter::new(&[], &["**/*.tmp".to_string()]);
@@ -1636,7 +1636,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_diffstore");
+        let dir = std::env::temp_dir().join("quay_test_worker_diffstore");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1644,7 +1644,7 @@ mod tests {
         let file_path = dir.join("tracked.html");
         std::fs::write(&file_path, "<html><body>v1</body></html>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
         let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
 
         let ctx = WorkerContext {
@@ -1697,11 +1697,11 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["original".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_hotreload_cfg");
+        let dir = std::env::temp_dir().join("quay_test_worker_quay_cfg");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         // Write a valid config for hot-reload.
         std::fs::write(
             &cfg_path,
@@ -1770,7 +1770,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_multipath");
+        let dir = std::env::temp_dir().join("quay_test_worker_multipath");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1779,7 +1779,7 @@ mod tests {
         std::fs::write(&html1, "<a>").unwrap();
         std::fs::write(&html2, "<b>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1826,10 +1826,10 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_emptypaths");
+        let dir = std::env::temp_dir().join("quay_test_worker_emptypaths");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1873,7 +1873,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_generic_fallback");
+        let dir = std::env::temp_dir().join("quay_test_worker_generic_fallback");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1881,7 +1881,7 @@ mod tests {
         let rs_path = dir.join("lib.rs");
         std::fs::write(&rs_path, "fn main() {}").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1927,14 +1927,14 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_css_fallback");
+        let dir = std::env::temp_dir().join("quay_test_worker_css_fallback");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
         let css_path = dir.join("theme.css");
         std::fs::write(&css_path, "h1 { color: green; }").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -1980,14 +1980,14 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_htm");
+        let dir = std::env::temp_dir().join("quay_test_worker_htm");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
         let htm_path = dir.join("index.htm");
         std::fs::write(&htm_path, "<html></html>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2032,7 +2032,7 @@ mod tests {
         let (btx, _brx) = broadcast::channel::<String>(256);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_rapidfire");
+        let dir = std::env::temp_dir().join("quay_test_worker_rapidfire");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2042,7 +2042,7 @@ mod tests {
             std::fs::write(&path, format!("<p>{}</p>", i)).unwrap();
         }
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2090,10 +2090,10 @@ mod tests {
         let (btx, _brx) = broadcast::channel::<String>(64);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_mixedchaos");
+        let dir = std::env::temp_dir().join("quay_test_worker_mixedchaos");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2174,7 +2174,7 @@ mod tests {
 
     #[test]
     fn broadcast_inject_css_binary_content_still_encodes() {
-        let dir = std::env::temp_dir().join("watchd_test_inject_binary");
+        let dir = std::env::temp_dir().join("quay_test_inject_binary");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("binary.css");
@@ -2207,7 +2207,7 @@ mod tests {
 
     #[test]
     fn broadcast_inject_css_unicode_filename() {
-        let dir = std::env::temp_dir().join("watchd_test_inject_unicode_name");
+        let dir = std::env::temp_dir().join("quay_test_inject_unicode_name");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("样式.css");
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[test]
     fn notify_clients_auto_mode_real_css_file_injects() {
-        let dir = std::env::temp_dir().join("watchd_test_notify_auto_real_css");
+        let dir = std::env::temp_dir().join("quay_test_notify_auto_real_css");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("real.css");
@@ -2248,10 +2248,10 @@ mod tests {
 
     #[test]
     fn try_reload_configs_complex_yaml() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_complex");
+        let dir = std::env::temp_dir().join("quay_test_reload_complex");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(
             &cfg_path,
             r#"
@@ -2312,10 +2312,10 @@ mod tests {
 
     #[test]
     fn try_reload_configs_whitespace_and_comments_only() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_comments");
+        let dir = std::env::temp_dir().join("quay_test_reload_comments");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
         std::fs::write(&cfg_path, "# just a comment\n\n  \n# another comment\n").unwrap();
 
         let result = try_reload_configs(&cfg_path);
@@ -2337,7 +2337,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["css".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_diff_cfg");
+        let dir = std::env::temp_dir().join("quay_test_worker_diff_cfg");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2357,7 +2357,7 @@ mod tests {
         };
         cfg.compile_watch_set();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2421,13 +2421,13 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(32);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_interleaved");
+        let dir = std::env::temp_dir().join("quay_test_worker_interleaved");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let html_path = dir.join("test.html");
         std::fs::write(&html_path, "<html></html>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2479,13 +2479,13 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(32);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_debounce");
+        let dir = std::env::temp_dir().join("quay_test_worker_debounce");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let html_path = dir.join("debounce.html");
         std::fs::write(&html_path, "<html></html>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2547,7 +2547,7 @@ mod tests {
 
     #[test]
     fn broadcast_inject_css_message_has_three_fields() {
-        let dir = std::env::temp_dir().join("watchd_test_inject_fields");
+        let dir = std::env::temp_dir().join("quay_test_inject_fields");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let css_path = dir.join("fields.css");
@@ -2689,7 +2689,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["test".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_priority");
+        let dir = std::env::temp_dir().join("quay_test_worker_priority");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2707,7 +2707,7 @@ mod tests {
         };
         cfg.compile_watch_set();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2752,7 +2752,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["notifyonly".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_notify_only");
+        let dir = std::env::temp_dir().join("quay_test_worker_notify_only");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2770,7 +2770,7 @@ mod tests {
         };
         cfg.compile_watch_set();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2815,7 +2815,7 @@ mod tests {
         let statuses =
             crate::server::new_status_map(vec!["first".to_string(), "second".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_multi_cfg");
+        let dir = std::env::temp_dir().join("quay_test_worker_multi_cfg");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2845,7 +2845,7 @@ mod tests {
         };
         cfg2.compile_watch_set();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -2891,7 +2891,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(vec!["filtered".to_string()]);
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_cfg_ignore");
+        let dir = std::env::temp_dir().join("quay_test_worker_cfg_ignore");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2910,7 +2910,7 @@ mod tests {
         };
         cfg.compile_watch_set();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         // Use the global filter to exclude *.js files.
         let filter = PathFilter::new(&[], &["**/*.js".to_string()]);
@@ -2959,10 +2959,10 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_remove");
+        let dir = std::env::temp_dir().join("quay_test_worker_remove");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -3008,7 +3008,7 @@ mod tests {
         let (btx, mut brx) = broadcast::channel::<String>(8);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_rename");
+        let dir = std::env::temp_dir().join("quay_test_worker_rename");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -3016,7 +3016,7 @@ mod tests {
         let new_path = dir.join("new.html");
         std::fs::write(&new_path, "<renamed>").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let ctx = WorkerContext {
             rx,
@@ -3065,10 +3065,10 @@ mod tests {
         let (btx, _brx) = broadcast::channel::<String>(256);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_create_delete");
+        let dir = std::env::temp_dir().join("quay_test_worker_create_delete");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         let diff_store = crate::kv::DiffStore::new_shared(10, 50, 4096);
 
@@ -3139,10 +3139,10 @@ mod tests {
         let (btx, _brx) = broadcast::channel::<String>(512);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_concurrent_send");
+        let dir = std::env::temp_dir().join("quay_test_worker_concurrent_send");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
 
         // Create files for the senders to reference.
         for i in 0..10 {
@@ -3242,10 +3242,10 @@ mod tests {
 
     #[test]
     fn try_reload_configs_utf8_bom() {
-        let dir = std::env::temp_dir().join("watchd_test_reload_bom");
+        let dir = std::env::temp_dir().join("quay_test_reload_bom");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("hotreload.yaml");
+        let cfg_path = dir.join("quay.yaml");
 
         // UTF-8 BOM + valid YAML.  serde_yaml may or may not handle the BOM
         // gracefully — the key property is that it must not panic.
@@ -3270,11 +3270,11 @@ mod tests {
         let (btx, _brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_diff_missing");
+        let dir = std::env::temp_dir().join("quay_test_worker_diff_missing");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
         let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
 
         let ctx = WorkerContext {
@@ -3321,7 +3321,7 @@ mod tests {
         let (btx, _brx) = broadcast::channel::<String>(16);
         let statuses = crate::server::new_status_map(Vec::<String>::new());
 
-        let dir = std::env::temp_dir().join("watchd_test_worker_diff_filtered");
+        let dir = std::env::temp_dir().join("quay_test_worker_diff_filtered");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
@@ -3333,7 +3333,7 @@ mod tests {
         let rs_path = dir.join("allowed.rs");
         std::fs::write(&rs_path, "fn main() {}").unwrap();
 
-        let cfg_path = dir.join("hotreload.yaml").into_boxed_path();
+        let cfg_path = dir.join("quay.yaml").into_boxed_path();
         let diff_store = crate::kv::DiffStore::new_shared(50, 500, 512 * 1024);
 
         // Filter that excludes *.tmp files (matches DEFAULT_EXCLUDES behaviour).

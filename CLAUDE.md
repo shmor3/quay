@@ -2,15 +2,15 @@
 
 ## Project Overview
 
-**watchd** (hotreload) is a minimal, language-agnostic file watcher written in Rust. It runs commands when files change and broadcasts `reload` or `inject-css` messages to browser clients via WebSocket.
+**quay** (quay) is a minimal, language-agnostic file watcher written in Rust. It runs commands when files change and broadcasts `reload` or `inject-css` messages to browser clients via WebSocket.
 
 ## Repository Structure
 
 ```
-hotreload/
+quay/
 ├── Cargo.toml              # Workspace root (resolver = "2")
-├── watcher/                # Main binary crate ("hotreload-watcher")
-│   ├── Cargo.toml          # Dependencies and [bin] definition (binary: watchd)
+├── watcher/                # Main binary crate ("quay")
+│   ├── Cargo.toml          # Dependencies and [bin] definition (binary: quay)
 │   ├── src/
 │   │   ├── main.rs         # Entry point, startup orchestration, module registration
 │   │   ├── cli.rs          # CLI argument definitions (clap derive)
@@ -21,7 +21,7 @@ hotreload/
 │   │   ├── debounce.rs     # Per-path event debouncer with periodic pruning
 │   │   ├── error.rs        # Centralised error type (WatchdError, thiserror)
 │   │   ├── filter.rs       # Glob-based include/exclude path filtering (globset)
-│   │   ├── health.rs       # Worker thread health monitoring / watchdog
+│   │   ├── health.rs       # Worker thread health monitoring / quayog
 │   │   ├── kv.rs           # Bounded in-memory diff store (similar crate)
 │   │   ├── server.rs       # WebSocket server, status map infrastructure
 │   │   ├── validate.rs     # Input validation helpers for CLI arguments
@@ -50,7 +50,7 @@ cargo build --manifest-path watcher/Cargo.toml
 cargo run --manifest-path watcher/Cargo.toml -- --path .
 
 # Run the produced binary directly
-./watcher/target/debug/watchd --path .
+./watcher/target/debug/quay --path .
 
 # Run with debug logging
 RUST_LOG=debug cargo run --manifest-path watcher/Cargo.toml -- --path .
@@ -73,8 +73,8 @@ cargo test --manifest-path watcher/Cargo.toml -- --test-threads=4
 
 ### Language & Tooling
 - **Rust edition 2021**, workspace with resolver v2
-- Binary name: `watchd` (defined in `watcher/Cargo.toml` as `[[bin]]`)
-- Crate name: `hotreload-watcher` (v0.2.0)
+- Binary name: `quay` (defined in `watcher/Cargo.toml` as `[[bin]]`)
+- Crate name: `quay` (v0.2.0)
 
 ### Core Dependencies
 - `notify 6.1` — cross-platform filesystem watching
@@ -93,12 +93,12 @@ cargo test --manifest-path watcher/Cargo.toml -- --test-threads=4
 
 ### Architecture Patterns
 - **Async Tokio tasks** for WebSocket server and control socket
-- **Dedicated OS thread** (`watchd-worker`) for the blocking event loop — avoids starving the async runtime
+- **Dedicated OS thread** (`quay-worker`) for the blocking event loop — avoids starving the async runtime
 - **Graceful shutdown** via Ctrl-C with `CancellationToken` (tokio-util) propagated to all tasks
-- **Worker watchdog** (`health.rs`) — background Tokio task polls the worker thread's `JoinHandle`; triggers shutdown if the thread dies
+- **Worker quayog** (`health.rs`) — background Tokio task polls the worker thread's `JoinHandle`; triggers shutdown if the thread dies
 - **Panic recovery** — individual event handlers are wrapped in `catch_unwind` so one bad path doesn't kill the worker
 - **Debounced file events** — configurable debounce delay with periodic pruning of stale entries
-- **Config hot-reload** — editing `hotreload.yaml` at the watch root reloads without restart
+- **Config hot-reload** — editing `quay.yaml` at the watch root reloads without restart
 - **Control socket** on port+1 for CLI subcommands (`status`, `reload`, `diff`, `diffs`, `diff-clear`)
 
 ### Module Responsibilities (after refactoring)
@@ -137,7 +137,7 @@ JSON-over-TCP on port+1. One newline-terminated command per connection:
 - `{"cmd":"diff-clear"}` → `{"status":"ok"}`
 
 ### Configuration
-- Project config lives in `hotreload.yaml` at the watch root
+- Project config lives in `quay.yaml` at the watch root
 - CLI flags override config file values
 - Default WebSocket port: `3012`, default bind: `127.0.0.1`
 - Control socket port: WebSocket port + 1
@@ -163,6 +163,6 @@ JSON-over-TCP on port+1. One newline-terminated command per connection:
 - `tmp_test_watch/` is also gitignored (used in testing)
 - The `examples/` directory is documentation/reference only — not part of the Rust build
 - When adding new modules, register them in `watcher/src/main.rs`
-- `watcher::start()` returns `(RecommendedWatcher, JoinHandle<()>)` — the watcher must be kept alive and the handle is passed to the health watchdog
+- `watcher::start()` returns `(RecommendedWatcher, JoinHandle<()>)` — the watcher must be kept alive and the handle is passed to the health quayog
 - On Windows, control socket integration tests may need `--test-threads=4` to avoid flakiness from connection resets
 - The `normalize_path` function in `filter.rs` and `normalize_pattern` in `config.rs` both convert backslashes to forward slashes — they are kept separate because they operate on different semantic types (file paths vs. glob patterns)

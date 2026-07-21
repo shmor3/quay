@@ -1,6 +1,6 @@
 # Python Hot-Reload Client
 
-A WebSocket client that connects to a running `watchd` server and reacts to
+A WebSocket client that connects to a running `quay` server and reacts to
 file-change notifications. Supports both **async** (`websockets`) and
 **synchronous** (`websocket-client`) modes.
 
@@ -20,13 +20,13 @@ pip install websocket-client
 
 ```bash
 # Default: connect to ws://localhost:3012
-python hotreload_client.py
+python quay_client.py
 
 # Custom host and port
-python hotreload_client.py --host 192.168.1.10 --port 4000
+python quay_client.py --host 192.168.1.10 --port 4000
 
 # Use the synchronous client instead of asyncio
-python hotreload_client.py --sync
+python quay_client.py --sync
 ```
 
 ## Usage as a Library
@@ -34,7 +34,7 @@ python hotreload_client.py --sync
 ### Async client
 
 ```python
-from hotreload_client import HotReloadClient
+from quay_client import HotReloadClient
 
 def on_reload():
     print("Files changed — restarting server...")
@@ -58,7 +58,7 @@ client.run()
 
 ```python
 import asyncio
-from hotreload_client import HotReloadClient
+from quay_client import HotReloadClient
 
 async def main():
     client = HotReloadClient(
@@ -73,7 +73,7 @@ asyncio.run(main())
 ### Synchronous client
 
 ```python
-from hotreload_client import HotReloadClientSync
+from quay_client import HotReloadClientSync
 
 client = HotReloadClientSync(
     port=3012,

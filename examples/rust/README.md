@@ -1,6 +1,6 @@
 # Rust Hot-Reload Client
 
-A standalone WebSocket client that connects to a running `watchd` server and reacts to `reload` and `inject-css` messages.
+A standalone WebSocket client that connects to a running `quay` server and reacts to `reload` and `inject-css` messages.
 
 ## Requirements
 
@@ -31,7 +31,7 @@ cargo run -- ws://localhost:3012
 
 ## How It Works
 
-1. Opens a WebSocket connection to the `watchd` server (default `ws://127.0.0.1:3012`).
+1. Opens a WebSocket connection to the `quay` server (default `ws://127.0.0.1:3012`).
 2. Listens for incoming JSON messages.
 3. Dispatches to handler functions based on the message `type`:
    - `"reload"` → calls `on_reload()`

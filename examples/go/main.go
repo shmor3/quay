@@ -1,6 +1,6 @@
-// hotreload client for Go
+// quay client for Go
 //
-// A standalone WebSocket client that connects to a running watchd server and
+// A standalone WebSocket client that connects to a running quay server and
 // reacts to hot-reload messages. Useful for triggering rebuilds, restarting
 // services, or executing arbitrary callbacks when files change.
 //
@@ -15,7 +15,7 @@
 //
 // Protocol:
 //
-//	The watchd server sends JSON messages over WebSocket:
+//	The quay server sends JSON messages over WebSocket:
 //	  - {"type": "reload"}                                      → full reload
 //	  - {"type": "inject-css", "path": "...", "content": "..."}  → CSS injection (base64 content)
 
@@ -36,7 +36,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Message represents a watchd WebSocket message.
+// Message represents a quay WebSocket message.
 type Message struct {
 	Type    string `json:"type"`
 	Path    string `json:"path,omitempty"`
@@ -46,11 +46,11 @@ type Message struct {
 const (
 	initialDelay = 1 * time.Second
 	maxDelay     = 30 * time.Second
-	logPrefix    = "[hotreload] "
+	logPrefix    = "[quay] "
 )
 
 func main() {
-	addr := flag.String("addr", "ws://127.0.0.1:3012", "watchd WebSocket server address")
+	addr := flag.String("addr", "ws://127.0.0.1:3012", "quay WebSocket server address")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime)
@@ -94,7 +94,7 @@ func main() {
 	}
 }
 
-// connectAndListen establishes a WebSocket connection to the watchd server,
+// connectAndListen establishes a WebSocket connection to the quay server,
 // reads messages in a loop, and dispatches them to handler functions.
 // It returns when the connection is closed or an error occurs.
 func connectAndListen(addr string, sigCh chan os.Signal) error {

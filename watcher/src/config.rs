@@ -1,4 +1,4 @@
-//! Configuration file parsing for `hotreload.yaml`.
+//! Configuration file parsing for `quay.yaml`.
 //!
 //! Supports both a single config mapping and a YAML sequence of configs.
 //! Each config entry describes watch patterns, commands to run, notification
@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::command::shell_escape;
 
-/// A single configuration entry parsed from `hotreload.yaml`.
+/// A single configuration entry parsed from `quay.yaml`.
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
     pub name: String,
@@ -21,11 +21,6 @@ pub struct ConfigEntry {
     pub build: Option<String>,
     pub notify: NotifyMode,
     pub ignore: Vec<String>,
-    pub auth_token: Option<String>, // Optional authentication token
-    pub tls_cert: Option<String>,   // Optional TLS certificate path
-    pub tls_key: Option<String>,    // Optional TLS key path
-    pub max_connections: Option<u32>, // Optional connection limit
-    pub expose_network: bool, // Defaults to false (secure)
 }
 
 /// Notification mode controlling how browser clients are informed of changes.
@@ -78,17 +73,6 @@ struct RawConfig {
 
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     ignore: Vec<String>,
-
-    #[serde(default)]
-    auth_token: Option<String>,
-    #[serde(default)]
-    tls_cert: Option<String>,
-    #[serde(default)]
-    tls_key: Option<String>,
-    #[serde(default)]
-    max_connections: Option<u32>,
-    #[serde(default)]
-    expose_network: Option<bool>,
 }
 
 fn default_name() -> String {
@@ -135,11 +119,6 @@ impl From<RawConfig> for ConfigEntry {
             build: raw.build,
             notify,
             ignore,
-            auth_token: raw.auth_token,
-            tls_cert: raw.tls_cert,
-            tls_key: raw.tls_key,
-            max_connections: raw.max_connections,
-            expose_network: raw.expose_network.unwrap_or(false),
         }
     }
 }
@@ -195,7 +174,7 @@ impl ConfigEntry {
 // Public parsing API
 // ---------------------------------------------------------------------------
 
-/// Parse the contents of a `hotreload.yaml` file into a list of [`ConfigEntry`] values.
+/// Parse the contents of a `quay.yaml` file into a list of [`ConfigEntry`] values.
 ///
 /// The YAML may be either:
 /// - A single mapping (one config)
@@ -212,7 +191,7 @@ pub fn parse_configs(yaml: &str) -> Vec<ConfigEntry> {
         return vec![ConfigEntry::from(raw)];
     }
 
-    warn!("failed to parse hotreload.yaml as YAML; no configs loaded");
+    warn!("failed to parse quay.yaml as YAML; no configs loaded");
     Vec::new()
 }
 
@@ -979,3 +958,5 @@ another_extra: 42
         assert_eq!(result, "make 'evil;payload'");
     }
 }
+
+

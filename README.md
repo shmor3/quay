@@ -1,15 +1,15 @@
-# watchd
+# quay
 
 A minimal, language-agnostic file watcher that runs commands when files change and broadcasts reload or CSS-inject messages to browser clients via WebSocket.
 
 ## Features
 
 - **Recursive directory watching** with configurable debounce
-- **YAML-based configuration** (`hotreload.yaml`) for per-project build/run logic
+- **YAML-based configuration** (`quay.yaml`) for per-project build/run logic
 - **WebSocket server** broadcasts `reload` and `inject-css` messages to connected browsers
 - **CSS hot-injection** — CSS changes are applied without a full page reload
 - **Embeddable JavaScript client** with automatic reconnection and exponential backoff
-- **Config hot-reload** — editing `hotreload.yaml` reloads configs automatically without restarting the server
+- **Config hot-reload** — editing `quay.yaml` reloads configs automatically without restarting the server
 - **Event kind filtering** — only data-affecting events (create, modify content, remove, rename) are processed; pure metadata and access events are ignored
 - **Command timeout** — optional per-command timeout prevents stuck build processes from blocking the worker
 - **Control socket** for CLI subcommands (`status`, `reload`, `diff`) against a running instance
@@ -19,7 +19,7 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 - **Input validation** — bind address, debounce delay, port, and timeout values are validated at startup with actionable error messages
 - **Shell escaping** — file paths interpolated into command templates are escaped to prevent command injection
 - **Sensible defaults** — common directories (`target/`, `.git/`, `node_modules/`, etc.) are excluded automatically
-- **Worker health monitoring** — a background watchdog detects if the file-watcher thread terminates unexpectedly and initiates graceful shutdown
+- **Worker health monitoring** — a background quayog detects if the file-watcher thread terminates unexpectedly and initiates graceful shutdown
 - **Graceful shutdown** via Ctrl-C with coordinated cancellation across all tasks
 - **Structured logging** via `tracing` (configurable with `RUST_LOG` environment variable)
 - **Self-healing** — accept errors on WebSocket and control sockets trigger a 1-second backoff and retry rather than crashing; the worker thread catches panics in individual event handlers and continues processing
@@ -38,32 +38,32 @@ A minimal, language-agnostic file watcher that runs commands when files change a
    ```bash
    cargo run --manifest-path watcher/Cargo.toml -- --path .
    ```
-5. Optionally, copy the produced binary from `watcher/target/debug/watchd` to your PATH for easier usage.
+5. Optionally, copy the produced binary from `watcher/target/debug/quay` to your PATH for easier usage.
 
 ### Configuration
 
-- Place a `hotreload.yaml` file in your project root. See below and `watcher/README.md` for config details.
+- Place a `quay.yaml` file in your project root. See below and `watcher/README.md` for config details.
 - Use CLI flags to override defaults (see below).
 
 ### Troubleshooting
 
 - If the watcher does not start, check for errors in the console. Common issues:
-  - Invalid YAML config: check for syntax errors in `hotreload.yaml`.
+  - Invalid YAML config: check for syntax errors in `quay.yaml`.
   - Port already in use: change the `--port` flag or stop other processes.
   - Permission denied: ensure you have access to the watch path.
 - For detailed logs, set `RUST_LOG=debug`.
 
 ### Common Errors
 
-- `Failed to parse hotreload.yaml`: Check YAML syntax and required fields.
+- `Failed to parse quay.yaml`: Check YAML syntax and required fields.
 - `Bind error`: Port/address in use or invalid. Try a different port/address.
 - `Command failed`: Check your `on_change` command for correctness.
 - `Diff store disabled`: Use `--diff` flag to enable diff tracking.
 
 ### FAQ
 
-**Q: How do I add hotreload to my HTML page?**
-A: Use `watchd --print-snippet` to get the script tag, or copy `hotreload-client.js` to your static assets.
+**Q: How do I add quay to my HTML page?**
+A: Use `quay --print-snippet` to get the script tag, or copy `quay-client.js` to your static assets.
 
 **Q: Can I use this with any language?**
 A: Yes, configs are language-agnostic. Use `on_change` to run any build command.
@@ -72,19 +72,19 @@ A: Yes, configs are language-agnostic. Use `on_change` to run any build command.
 A: Set `RUST_LOG=debug` and check the console output for event details.
 
 **Q: How do I run multiple configs?**
-A: Use a YAML sequence in `hotreload.yaml` (see examples).
+A: Use a YAML sequence in `quay.yaml` (see examples).
 
 **Q: What if my build command hangs?**
 A: Use `--cmd-timeout-ms` to kill stuck commands automatically.
 
 **Q: How do I clear diffs?**
-A: Use the `diff-clear` control command: `watchd --port <port> diff-clear`.
+A: Use the `diff-clear` control command: `quay --port <port> diff-clear`.
 
 **Q: How do I expose the server to other machines?**
 A: Use `--bind 0.0.0.0` but beware of security risks (see Security Considerations).
 
 **Q: How do I get help?**
-A: Run `watchd --help` or consult `watcher/README.md` for full documentation.
+A: Run `quay --help` or consult `watcher/README.md` for full documentation.
 
 ---
 
@@ -97,28 +97,28 @@ cargo build --manifest-path watcher/Cargo.toml
 cargo run --manifest-path watcher/Cargo.toml -- --path .
 ```
 
-Or run the produced binary directly (built at `watcher/target/debug/watchd`):
+Or run the produced binary directly (built at `watcher/target/debug/quay`):
 
 ```bash
-./watcher/target/debug/watchd --path .
+./watcher/target/debug/quay --path .
 ```
 
-Configuration is read from `hotreload.yaml` located at the watch root. See `watcher/README.md` for full documentation and examples.
+Configuration is read from `quay.yaml` located at the watch root. See `watcher/README.md` for full documentation and examples.
 
 ## CLI
 
-The `watchd` program supports flags and subcommands. Run the watcher server (default) or invoke control subcommands which contact the running watchd control socket on port+1.
+The `quay` program supports flags and subcommands. Run the watcher server (default) or invoke control subcommands which contact the running quay control socket on port+1.
 
 ### Server mode (default)
 
 ```
-watchd [OPTIONS] [CMD_TEMPLATE]
+quay [OPTIONS] [CMD_TEMPLATE]
 ```
 
 | Flag / Argument           | Default              | Description                                                       |
 |---------------------------|----------------------|-------------------------------------------------------------------|
 | `[CMD_TEMPLATE]`          | `echo files changed` | Command to run on changes. Use `{path}` for the changed file path |
-| `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `hotreload.yaml`         |
+| `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `quay.yaml`         |
 | `--port <PORT>`           | `3012`               | WebSocket server port                                             |
 | `--bind <ADDR>`           | `127.0.0.1`          | Address to bind the WebSocket and control servers to              |
 | `--debounce-ms <MS>`      | `200`                | Debounce delay in milliseconds                                    |
@@ -130,9 +130,9 @@ watchd [OPTIONS] [CMD_TEMPLATE]
 
 ### Client-mode subcommands
 
-These contact the running `watchd` instance via the control socket (port + 1):
+These contact the running `quay` instance via the control socket (port + 1):
 
-- `status` — query the running watchd for status of loaded configs and active connections
+- `status` — query the running quay for status of loaded configs and active connections
 - `reload` — request an immediate reload; broadcasts a `reload` message to all connected clients
 - `diff --path <FILE>` — show the latest diff for a specific file (requires `--diff` on the server)
 - `diff` — list all tracked files with a summary (requires `--diff` on the server)
@@ -144,39 +144,39 @@ These contact the running `watchd` instance via the control socket (port + 1):
 cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project --port 3012
 
 # run the produced binary directly
-./watcher/target/debug/watchd --path .
+./watcher/target/debug/quay --path .
 
 # use a command timeout to kill stuck builds after 30 seconds
-./watcher/target/debug/watchd --path . --cmd-timeout-ms 30000
+./watcher/target/debug/quay --path . --cmd-timeout-ms 30000
 
 # enable the diff store to track file changes
-./watcher/target/debug/watchd --path . --diff
+./watcher/target/debug/quay --path . --diff
 
 # enable diff with a custom max file size (1 MiB)
-./watcher/target/debug/watchd --path . --diff --diff-max-file-size 1048576
+./watcher/target/debug/quay --path . --diff --diff-max-file-size 1048576
 
 # bind to all interfaces (accessible from other machines on the network)
-./watcher/target/debug/watchd --path . --bind 0.0.0.0
+./watcher/target/debug/quay --path . --bind 0.0.0.0
 
 # print the browser client snippet for embedding
-./watcher/target/debug/watchd --print-snippet
+./watcher/target/debug/quay --print-snippet
 
 # query status (client-mode subcommand)
-./watcher/target/debug/watchd --port 3012 status
+./watcher/target/debug/quay --port 3012 status
 
 # trigger reload (client-mode subcommand)
-./watcher/target/debug/watchd --port 3012 reload
+./watcher/target/debug/quay --port 3012 reload
 
 # query the latest diff for a file (client-mode subcommand)
-./watcher/target/debug/watchd --port 3012 diff --path src/styles/main.css
+./watcher/target/debug/quay --port 3012 diff --path src/styles/main.css
 
 # list all tracked file diffs (client-mode subcommand)
-./watcher/target/debug/watchd --port 3012 diff
+./watcher/target/debug/quay --port 3012 diff
 ```
 
 ## Client Libraries
 
-The `watchd` server is **language-agnostic** — any WebSocket client that understands the simple JSON protocol can integrate with it. Example clients are provided in the [`examples/`](examples/) directory for multiple languages and platforms:
+The `quay` server is **language-agnostic** — any WebSocket client that understands the simple JSON protocol can integrate with it. Example clients are provided in the [`examples/`](examples/) directory for multiple languages and platforms:
 
 | Directory                              | Language / Platform        | Description                                        |
 |----------------------------------------|----------------------------|----------------------------------------------------|
@@ -196,13 +196,13 @@ See [`examples/README.md`](examples/README.md) for the full WebSocket protocol s
 Add the hot-reload client to your HTML pages to receive live updates. Use `--print-snippet` to generate the appropriate `<script>` tag, or include the standalone file from `examples/javascript/`:
 
 ```html
-<script src="/hotreload-client.js"></script>
+<script src="/quay-client.js"></script>
 ```
 
 Override the default port with a `data-port` attribute:
 
 ```html
-<script src="/hotreload-client.js" data-port="4000"></script>
+<script src="/quay-client.js" data-port="4000"></script>
 ```
 
 The browser client will:
@@ -215,7 +215,7 @@ The browser client will:
 
 ### Writing your own client
 
-Implementing a watchd client in any language is straightforward:
+Implementing a quay client in any language is straightforward:
 
 1. Open a WebSocket connection to `ws://localhost:3012`.
 2. Listen for incoming text messages.
@@ -345,7 +345,7 @@ The control socket listens on `port + 1` (e.g. `3013` when the WebSocket port is
 
 ## Configuration
 
-Place a `hotreload.yaml` file in the watch root directory. It can contain a single config mapping or a YAML sequence of configs.
+Place a `quay.yaml` file in the watch root directory. It can contain a single config mapping or a YAML sequence of configs.
 
 ### Config fields
 
@@ -388,7 +388,7 @@ ignore:
 
 ### Config hot-reload
 
-When `hotreload.yaml` itself is modified, watchd automatically reloads its config entries without requiring a server restart. The status map is updated and new configs take effect immediately.
+When `quay.yaml` itself is modified, quay automatically reloads its config entries without requiring a server restart. The status map is updated and new configs take effect immediately.
 
 ### Notification modes
 
@@ -411,11 +411,11 @@ The following patterns are always excluded unless the file matches an explicit `
 - `**/.DS_Store`
 - `**/Thumbs.db`
 - `**/*.lock`
-- `**/hotreload.yaml`
+- `**/quay.yaml`
 
 ### Fallback behaviour
 
-When no config matches a changed file, watchd uses built-in heuristics:
+When no config matches a changed file, quay uses built-in heuristics:
 
 1. **`.css` files** → inject CSS via WebSocket (no full reload).
 2. **`.html` / `.htm` files** → broadcast a full-page reload.
@@ -436,28 +436,28 @@ This reduces noise and prevents unnecessary rebuilds from editors that touch fil
 
 ## Diff Store
 
-When started with `--diff`, watchd records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
+When started with `--diff`, quay records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
 
 ### Enabling
 
 ```bash
-watchd --path . --diff
+quay --path . --diff
 ```
 
 Optionally adjust the maximum file size (files larger than this are recorded with a placeholder instead of a real diff):
 
 ```bash
-watchd --path . --diff --diff-max-file-size 1048576
+quay --path . --diff --diff-max-file-size 1048576
 ```
 
 ### Querying diffs
 
 ```bash
 # Latest diff for a specific file
-watchd --port 3012 diff --path src/main.css
+quay --port 3012 diff --path src/main.css
 
 # Summary of all tracked files
-watchd --port 3012 diff
+quay --port 3012 diff
 ```
 
 ### Limits
@@ -475,7 +475,7 @@ Files exceeding the size limit are recorded with a `<file too large>` placeholde
 Use `--cmd-timeout-ms` to prevent stuck build commands from blocking the worker thread indefinitely:
 
 ```bash
-watchd --path . --cmd-timeout-ms 30000
+quay --path . --cmd-timeout-ms 30000
 ```
 
 If a command exceeds the timeout, the process is killed and the worker continues processing subsequent events. Commands that finish within the timeout are unaffected.
@@ -484,7 +484,7 @@ If a command exceeds the timeout, the process is killed and the worker continues
 
 ### Network exposure
 
-By default, watchd binds to `127.0.0.1` (localhost only). This means:
+By default, quay binds to `127.0.0.1` (localhost only). This means:
 
 - The WebSocket server is accessible only from the local machine.
 - The control socket is accessible only from the local machine.
@@ -513,9 +513,9 @@ The control socket limits incoming requests to 64 KiB to prevent denial-of-servi
 
 ## Recovery and Self-Healing
 
-### Worker thread watchdog
+### Worker thread quayog
 
-A background watchdog monitors the file-watcher worker thread. If the thread terminates unexpectedly (panic that escapes `catch_unwind`, channel closure, or any other fatal error), the watchdog:
+A background quayog monitors the file-watcher worker thread. If the thread terminates unexpectedly (panic that escapes `catch_unwind`, channel closure, or any other fatal error), the quayog:
 
 1. Logs the failure and any panic payload at `error` level.
 2. Triggers the cancellation token for coordinated shutdown.
@@ -541,7 +541,7 @@ All mutex operations (status map, diff store) handle lock poisoning gracefully b
 
 ### Process supervisor integration
 
-For production deployments, use a process supervisor (systemd, Docker restart policy, etc.) to restart watchd automatically on exit. The watchdog ensures watchd exits cleanly when the worker thread fails, making it compatible with restart-on-exit policies.
+For production deployments, use a process supervisor (systemd, Docker restart policy, etc.) to restart quay automatically on exit. The quayog ensures quay exits cleanly when the worker thread fails, making it compatible with restart-on-exit policies.
 
 ## Logging
 
@@ -549,13 +549,13 @@ Control verbosity with the `RUST_LOG` environment variable:
 
 ```bash
 # Default (info level)
-watchd --path .
+quay --path .
 
 # Debug output (includes skipped paths, event details, debouncer activity)
-RUST_LOG=debug watchd --path .
+RUST_LOG=debug quay --path .
 
 # Quiet (warnings and errors only)
-RUST_LOG=warn watchd --path .
+RUST_LOG=warn quay --path .
 ```
 
 ## Architecture

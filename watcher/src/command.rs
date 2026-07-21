@@ -44,7 +44,7 @@ use tracing::{error, warn};
 /// # // Platform-dependent examples shown for illustration.
 /// # #[cfg(not(target_os = "windows"))]
 /// # {
-/// # use hotreload_watcher::command::shell_escape;
+/// # use quay_watcher::command::shell_escape;
 /// assert_eq!(shell_escape("src/main.rs"), "'src/main.rs'");
 /// assert_eq!(shell_escape("it's a file"), "'it'\\''s a file'");
 /// # }
@@ -81,7 +81,7 @@ pub fn shell_escape(s: &str) -> String {
 /// Errors are logged but do **not** propagate — a failing build command should
 /// not crash the watcher.  Non-zero exit codes are logged at `warn` level;
 /// spawn/wait failures are logged at `error` level.
-pub fn run_command_blocking(cmd: &str, timeout: Option<Duration>, max_memory_mb: Option<u32>, max_cpu_seconds: Option<u32>) {
+pub fn run_command_blocking(cmd: &str, timeout: Option<Duration>, _max_memory_mb: Option<u32>, _max_cpu_seconds: Option<u32>) {
     let result = {
         #[cfg(target_os = "windows")]
         {
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn run_command_blocking_handles_echo() {
         // Just ensure it doesn't panic.
-        run_command_blocking("echo hello", None);
+        run_command_blocking("echo hello", None, None, None);
     }
 
     #[test]
@@ -308,9 +308,9 @@ mod tests {
         // We use a generous threshold so CI doesn't flake.
         let start = Instant::now();
         #[cfg(target_os = "windows")]
-        run_command_blocking("ping -n 10 127.0.0.1", Some(Duration::from_millis(500)));
+        run_command_blocking("ping -n 10 127.0.0.1", Some(Duration::from_millis(500)), None, None);
         #[cfg(not(target_os = "windows"))]
-        run_command_blocking("sleep 10", Some(Duration::from_millis(500)));
+        run_command_blocking("sleep 10", Some(Duration::from_millis(500)), None, None);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -323,7 +323,7 @@ mod tests {
     fn run_command_blocking_fast_command_with_timeout() {
         // A fast command with a long timeout should complete normally.
         let start = Instant::now();
-        run_command_blocking("echo fast", Some(Duration::from_secs(30)));
+        run_command_blocking("echo fast", Some(Duration::from_secs(30)), None, None);
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(5));
     }
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn run_command_blocking_nonexistent_command() {
         // Should log an error but not panic.
-        run_command_blocking("this_command_does_not_exist_12345", None);
+        run_command_blocking("this_command_does_not_exist_12345", None, None, None);
     }
 
     #[test]
@@ -339,46 +339,46 @@ mod tests {
         // Empty command — the shell should handle it gracefully.
         // On some shells this is a no-op; on others it may fail.
         // The key property is no panic.
-        run_command_blocking("", None);
+        run_command_blocking("", None, None, None);
     }
 
     #[test]
     fn run_command_blocking_failing_command() {
         // A command that exits with non-zero should log a warning but not panic.
         #[cfg(target_os = "windows")]
-        run_command_blocking("cmd /C exit 1", None);
+        run_command_blocking("cmd /C exit 1", None, None, None);
         #[cfg(not(target_os = "windows"))]
-        run_command_blocking("false", None);
+        run_command_blocking("false", None, None, None);
     }
 
     #[test]
     fn run_command_blocking_zero_timeout() {
         // A zero-ms timeout should still work (command likely killed immediately).
-        run_command_blocking("echo quick", Some(Duration::from_millis(0)));
+        run_command_blocking("echo quick", Some(Duration::from_millis(0)), None, None);
     }
 
     #[test]
     fn run_command_blocking_generous_timeout() {
         // A very generous timeout with a fast command should complete normally.
         let start = Instant::now();
-        run_command_blocking("echo hello", Some(Duration::from_secs(60)));
+        run_command_blocking("echo hello", Some(Duration::from_secs(60)), None, None);
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
     fn run_command_blocking_with_special_chars_in_args() {
         // Command with quotes and special characters — should not panic.
-        run_command_blocking("echo \"hello world\"", None);
-        run_command_blocking("echo path/with spaces/file.txt", None);
+        run_command_blocking("echo \"hello world\"", None, None, None);
+        run_command_blocking("echo path/with spaces/file.txt", None, None, None);
     }
 
     #[test]
     fn run_command_blocking_timeout_near_boundary() {
         let start = Instant::now();
         #[cfg(target_os = "windows")]
-        run_command_blocking("ping -n 100 127.0.0.1", Some(Duration::from_millis(200)));
+        run_command_blocking("ping -n 100 127.0.0.1", Some(Duration::from_millis(200)), None, None);
         #[cfg(not(target_os = "windows"))]
-        run_command_blocking("sleep 100", Some(Duration::from_millis(200)));
+        run_command_blocking("sleep 100", Some(Duration::from_millis(200)), None, None);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(3),

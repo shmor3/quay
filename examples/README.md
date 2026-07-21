@@ -1,7 +1,7 @@
 # Example Clients
 
 This directory contains example hot-reload clients for various languages and
-platforms. Each client connects to the `watchd` WebSocket server and reacts to
+platforms. Each client connects to the `quay` WebSocket server and reacts to
 file-change notifications.
 
 The server is **language-agnostic** — any WebSocket client that understands the
@@ -13,7 +13,7 @@ simple JSON protocol can integrate with it.
 
 ### Connection
 
-Connect to the watchd WebSocket server at:
+Connect to the quay WebSocket server at:
 
 ```
 ws://<host>:<port>
@@ -81,10 +81,10 @@ commands.
 
 ## Quick Start
 
-1. **Start the watchd server** in your project directory:
+1. **Start the quay server** in your project directory:
 
    ```bash
-   watchd --path /path/to/project --port 3012
+   quay --path /path/to/project --port 3012
    ```
 
 2. **Run any example client** — pick the language you prefer. Each directory
@@ -96,7 +96,7 @@ commands.
 
 ## Writing Your Own Client
 
-Implementing a watchd client in any language is straightforward:
+Implementing a quay client in any language is straightforward:
 
 1. Open a WebSocket connection to `ws://localhost:3012`.
 2. Listen for incoming text messages.

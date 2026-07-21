@@ -112,7 +112,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hotreload-client-example"
+name = "quay-client-example"
 version = "0.1.0"
 dependencies = [
  "base64",

@@ -1,4 +1,4 @@
-# watchd
+# quay
 
 A minimal, language-agnostic file watcher that runs commands when files change and broadcasts reload or CSS-inject messages to browser clients via WebSocket.
 
@@ -12,19 +12,19 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 
 - **Monitoring:** Prometheus metrics exposed on `127.0.0.1:9090` (health, reload count, WebSocket connections, diff count).
 - **Logging:** Structured logs enriched with tracing and operational events.
-- **Reliability:** Health/readiness endpoint, worker watchdog, graceful shutdown.
+- **Reliability:** Health/readiness endpoint, worker quayog, graceful shutdown.
 - **Scalability:** Bounded diff store, connection tracking, metrics for scaling.
 - **Operational Endpoints:** `/metrics` (Prometheus), health gauge, reload counter, WebSocket connection gauge.
 
 ### Prometheus Metrics
-- `watchd_health`: Health status (1=healthy, 0=unhealthy)
-- `watchd_reload_count`: Reload events triggered
-- `watchd_ws_connections`: Active WebSocket connections
-- `watchd_diff_count`: Total diffs in store
+- `quay_health`: Health status (1=healthy, 0=unhealthy)
+- `quay_reload_count`: Reload events triggered
+- `quay_ws_connections`: Active WebSocket connections
+- `quay_diff_count`: Total diffs in store
 
 ### Health/Readiness
 - Health endpoint on port 9090 returns Prometheus metrics
-- Worker watchdog updates health gauge
+- Worker quayog updates health gauge
 
 ### Logging
 - All major events are logged with tracing (startup, shutdown, errors, reloads, health changes)
@@ -35,11 +35,11 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 - Connection tracking for operational visibility
 
 - **Recursive directory watching** with configurable debounce
-- **YAML-based configuration** (`hotreload.yaml`) for per-project build/run logic
+- **YAML-based configuration** (`quay.yaml`) for per-project build/run logic
 - **WebSocket server** broadcasts `reload` and `inject-css` messages to connected browsers
 - **CSS hot-injection** — CSS changes are applied without a full page reload
 - **Embeddable JavaScript client** with automatic reconnection and exponential backoff
-- **Config hot-reload** — editing `hotreload.yaml` reloads configs automatically without restarting the server
+- **Config hot-reload** — editing `quay.yaml` reloads configs automatically without restarting the server
 - **Event kind filtering** — only data-affecting events (create, modify content, remove, rename) are processed; pure metadata and access events are ignored
 - **Command timeout** — optional per-command timeout prevents stuck build processes from blocking the worker
 - **Control socket** for CLI subcommands (`status`, `reload`, `diff`, `diffs`, `diff-clear`) against a running instance
@@ -49,7 +49,7 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 - **Input validation** — bind address, debounce delay, port, and timeout values are validated at startup with actionable error messages
 - **Shell escaping** — file paths interpolated into command templates are escaped to prevent command injection
 - **Sensible defaults** — common directories (`target/`, `.git/`, `node_modules/`, etc.) are excluded automatically
-- **Worker health monitoring** — a background watchdog detects if the file-watcher thread terminates unexpectedly and initiates graceful shutdown
+- **Worker health monitoring** — a background quayog detects if the file-watcher thread terminates unexpectedly and initiates graceful shutdown
 - **Graceful shutdown** via Ctrl-C with coordinated cancellation across all tasks
 - **Structured logging** via `tracing` (configurable with `RUST_LOG` environment variable)
 - **Self-healing** — accept errors on WebSocket and control sockets trigger a 1-second backoff and retry rather than crashing; the worker thread catches panics in individual event handlers and continues processing
@@ -68,7 +68,7 @@ The codebase is split into focused, single-responsibility modules:
 | `debounce.rs` | Per-path event debouncer with periodic pruning                        |
 | `error.rs`    | Centralised error type (`WatchdError`) via `thiserror`                |
 | `filter.rs`   | Glob-based include/exclude path filtering                             |
-| `health.rs`   | Worker thread health monitoring / watchdog                            |
+| `health.rs`   | Worker thread health monitoring / quayog                            |
 | `kv.rs`       | Bounded in-memory diff store for file change tracking                 |
 | `server.rs`   | WebSocket server accept loop and shared status-map infrastructure     |
 | `validate.rs` | Input validation helpers for CLI arguments                            |
@@ -99,10 +99,10 @@ The codebase is split into focused, single-responsibility modules:
 
 ### Configuration
 
-- Place a `hotreload.yaml` file in the watch root. See below for config fields and examples.
+- Place a `quay.yaml` file in the watch root. See below for config fields and examples.
 - Use CLI flags to override defaults (see CLI section).
 
-#### Example hotreload.yaml
+#### Example quay.yaml
 
 ```yaml
 - name: styles
@@ -133,15 +133,15 @@ The codebase is split into focused, single-responsibility modules:
 
 ### Common Errors
 
-- `Failed to parse hotreload.yaml`: Fix YAML syntax and required fields.
+- `Failed to parse quay.yaml`: Fix YAML syntax and required fields.
 - `Bind error`: Port/address in use or invalid.
 - `Command failed`: Check your `on_change` command.
 - `Diff store disabled`: Use `--diff` flag.
 
 ### FAQ
 
-**Q: How do I add hotreload to my HTML page?**
-A: Use `watchd --print-snippet` or copy `hotreload-client.js` to your static assets.
+**Q: How do I add quay to my HTML page?**
+A: Use `quay --print-snippet` or copy `quay-client.js` to your static assets.
 
 **Q: Can I use this with any language?**
 A: Yes, configs are language-agnostic.
@@ -150,7 +150,7 @@ A: Yes, configs are language-agnostic.
 A: Set `RUST_LOG=debug` for verbose logs.
 
 **Q: How do I run multiple configs?**
-A: Use a YAML sequence in `hotreload.yaml`.
+A: Use a YAML sequence in `quay.yaml`.
 
 **Q: What if my build command hangs?**
 A: Use `--cmd-timeout-ms` to kill stuck commands.
@@ -162,7 +162,7 @@ A: Use the `diff-clear` control command.
 A: Use `--bind 0.0.0.0` (see Security Considerations).
 
 **Q: How do I get help?**
-A: Run `watchd --help` or see this README.
+A: Run `quay --help` or see this README.
 
 ---
 
@@ -181,7 +181,7 @@ Run the watcher server:
 cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project
 
 # or run the produced binary directly
-./watcher/target/debug/watchd --path .
+./watcher/target/debug/quay --path .
 ```
 
 ## CLI reference
@@ -189,13 +189,13 @@ cargo run --manifest-path watcher/Cargo.toml -- --path /path/to/project
 ### Server mode (default)
 
 ```
-watchd [OPTIONS] [CMD_TEMPLATE]
+quay [OPTIONS] [CMD_TEMPLATE]
 ```
 
 | Flag / Argument           | Default              | Description                                                       |
 |---------------------------|----------------------|-------------------------------------------------------------------|
 | `[CMD_TEMPLATE]`          | `echo files changed` | Command to run on changes. Use `{path}` for the changed file path |
-| `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `hotreload.yaml`         |
+| `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `quay.yaml`         |
 | `--port <PORT>`           | `3012`               | WebSocket server port                                             |
 | `--bind <ADDR>`           | `127.0.0.1`          | Address to bind the WebSocket and control servers to              |
 | `--debounce-ms <MS>`      | `200`                | Debounce delay in milliseconds                                    |
@@ -207,59 +207,59 @@ watchd [OPTIONS] [CMD_TEMPLATE]
 
 ### Client-mode subcommands
 
-These contact the running `watchd` instance via the control socket (port + 1):
+These contact the running `quay` instance via the control socket (port + 1):
 
 ```bash
 # Query status of loaded configs and active connections
-watchd --port 3012 status
+quay --port 3012 status
 
 # Trigger an immediate reload
-watchd --port 3012 reload
+quay --port 3012 reload
 
 # Show the latest diff for a specific file (requires --diff on the server)
-watchd --port 3012 diff --path src/styles/main.css
+quay --port 3012 diff --path src/styles/main.css
 
 # List all tracked files with a summary (requires --diff on the server)
-watchd --port 3012 diff
+quay --port 3012 diff
 ```
 
 ## Browser client
 
-The `watchd` server broadcasts WebSocket messages, but your HTML pages need a small client script to receive them. There are several ways to add it:
+The `quay` server broadcasts WebSocket messages, but your HTML pages need a small client script to receive them. There are several ways to add it:
 
 ### Option 1 — Print the snippet
 
 Use the `--print-snippet` flag to output a ready-to-paste `<script>` tag:
 
 ```bash
-watchd --port 3012 --print-snippet
+quay --port 3012 --print-snippet
 ```
 
 This outputs both an inline `<script>` version (zero extra requests) and an external `<script src>` version.
 
 ### Option 2 — Serve the standalone file
 
-Copy `hotreload-client.js` from this repository into your project's static assets and include it:
+Copy `quay-client.js` from this repository into your project's static assets and include it:
 
 ```html
-<script src="/hotreload-client.js"></script>
+<script src="/quay-client.js"></script>
 ```
 
 ### Option 3 — Override the port
 
-If the watchd server runs on a non-default port, use the `data-port` attribute:
+If the quay server runs on a non-default port, use the `data-port` attribute:
 
 ```html
-<script src="/hotreload-client.js" data-port="4000"></script>
+<script src="/quay-client.js" data-port="4000"></script>
 ```
 
 ### Client features
 
 - **Auto-reconnect** with exponential backoff (1 s → 30 s cap)
 - **Full page reload** on `reload` messages
-- **CSS hot-injection** on `inject-css` messages — injects or updates `<style data-hotreload="...">` elements
+- **CSS hot-injection** on `inject-css` messages — injects or updates `<style data-quay="...">` elements
 - **Cache-busting** of `<link rel="stylesheet">` elements whose `href` matches the changed path
-- **Console logging** with coloured `[hotreload]` prefix
+- **Console logging** with coloured `[quay]` prefix
 - Zero external dependencies — pure vanilla JS
 
 ## WebSocket Protocol
@@ -306,28 +306,28 @@ JSON-over-TCP on port+1. One newline-terminated command per connection:
 
 ## Diff store
 
-When started with `--diff`, watchd records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
+When started with `--diff`, quay records a unified diff for every file change in a bounded in-memory store. Diffs can be queried via the control socket using the `diff` subcommand.
 
 ### Enabling
 
 ```bash
-watchd --path . --diff
+quay --path . --diff
 ```
 
 Optionally adjust the maximum file size (files larger than this are recorded with a placeholder instead of a real diff):
 
 ```bash
-watchd --path . --diff --diff-max-file-size 1048576
+quay --path . --diff --diff-max-file-size 1048576
 ```
 
 ### Querying diffs
 
 ```bash
 # Latest diff for a specific file
-watchd --port 3012 diff --path src/main.css
+quay --port 3012 diff --path src/main.css
 
 # Summary of all tracked files
-watchd --port 3012 diff
+quay --port 3012 diff
 ```
 
 ### Limits
@@ -342,7 +342,7 @@ Files exceeding the size limit are recorded with a `<file too large>` placeholde
 
 ## Configuration
 
-Place a `hotreload.yaml` file in the watch root directory. It can contain a single config mapping or a YAML sequence of configs.
+Place a `quay.yaml` file in the watch root directory. It can contain a single config mapping or a YAML sequence of configs.
 
 ### Config fields
 
@@ -385,7 +385,7 @@ ignore:
 
 ### Config hot-reload
 
-When `hotreload.yaml` itself is modified, watchd automatically reloads its config entries without requiring a server restart. The status map is updated and new configs take effect immediately.
+When `quay.yaml` itself is modified, quay automatically reloads its config entries without requiring a server restart. The status map is updated and new configs take effect immediately.
 
 ### Notification modes
 
@@ -408,7 +408,7 @@ The following patterns are always excluded unless the file matches an explicit `
 - `**/.DS_Store`
 - `**/Thumbs.db`
 - `**/*.lock`
-- `**/hotreload.yaml`
+- `**/quay.yaml`
 
 ### Event filtering
 
@@ -428,7 +428,7 @@ This reduces noise and prevents unnecessary rebuilds from editors that touch fil
 Use `--cmd-timeout-ms` to prevent stuck build commands from blocking the worker thread indefinitely:
 
 ```bash
-watchd --path . --cmd-timeout-ms 30000
+quay --path . --cmd-timeout-ms 30000
 ```
 
 If a command exceeds the timeout, the process is killed and the worker continues processing subsequent events. Commands that finish within the timeout are unaffected.
@@ -444,12 +444,12 @@ If a command exceeds the timeout, the process is killed and the worker continues
 
 ## Recovery and self-healing
 
-- **Worker watchdog** — a background task monitors the file-watcher worker thread and initiates coordinated shutdown if it terminates unexpectedly
+- **Worker quayog** — a background task monitors the file-watcher worker thread and initiates coordinated shutdown if it terminates unexpectedly
 - **Panic recovery** — individual event handlers are wrapped in `catch_unwind` so one bad path doesn't kill the worker
 - **Accept error resilience** — both WebSocket and control socket handle `accept()` errors with 1-second backoff and retry
 - **Debouncer pruning** — stale entries are periodically pruned to prevent unbounded memory growth
 - **Lock poisoning** — all mutex operations handle lock poisoning gracefully with warnings rather than panics
-- **Process supervisor integration** — the watchdog ensures clean exit on worker failure, compatible with systemd/Docker restart policies
+- **Process supervisor integration** — the quayog ensures clean exit on worker failure, compatible with systemd/Docker restart policies
 
 ## Logging
 
@@ -457,13 +457,13 @@ Logging uses the `tracing` framework. Control verbosity with the `RUST_LOG` envi
 
 ```bash
 # Default (info level)
-watchd --path .
+quay --path .
 
 # Debug output (includes skipped paths, event details, debouncer activity)
-RUST_LOG=debug watchd --path .
+RUST_LOG=debug quay --path .
 
 # Quiet (warnings and errors only)
-RUST_LOG=warn watchd --path .
+RUST_LOG=warn quay --path .
 ```
 
 ## Extensibility

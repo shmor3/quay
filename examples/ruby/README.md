@@ -1,6 +1,6 @@
 # Ruby Hot-Reload Client
 
-A WebSocket client for Ruby that connects to a running `watchd` server and
+A WebSocket client for Ruby that connects to a running `quay` server and
 reacts to file-change notifications.
 
 ## Requirements
@@ -26,16 +26,16 @@ gem "websocket-client-simple"
 
 ```bash
 # Connect to the default address (localhost:3012)
-ruby hotreload_client.rb
+ruby quay_client.rb
 
 # Custom host and port
-ruby hotreload_client.rb 192.168.1.10 4000
+ruby quay_client.rb 192.168.1.10 4000
 ```
 
 ### As a Library
 
 ```ruby
-require_relative "hotreload_client"
+require_relative "quay_client"
 
 client = HotReload::Client.new(host: "localhost", port: 3012)
 
@@ -60,23 +60,23 @@ client.start
 ### Integration with Rails
 
 ```ruby
-# config/initializers/hotreload.rb (development only)
+# config/initializers/quay.rb (development only)
 if Rails.env.development?
   Thread.new do
-    require_relative "../../lib/hotreload_client"
+    require_relative "../../lib/quay_client"
 
     client = HotReload::Client.new(port: 3012)
 
     client.on_reload do
-      Rails.logger.info "[hotreload] reload triggered"
+      Rails.logger.info "[quay] reload triggered"
       # ActionCable or Turbo Streams could forward this to the browser
     end
 
     client.on_css_inject do |path, css|
-      dest = Rails.root.join("public", "hotreload", File.basename(path))
+      dest = Rails.root.join("public", "quay", File.basename(path))
       FileUtils.mkdir_p(dest.dirname)
       File.write(dest, css)
-      Rails.logger.info "[hotreload] CSS written to #{dest}"
+      Rails.logger.info "[quay] CSS written to #{dest}"
     end
 
     client.start
@@ -94,7 +94,7 @@ end
 
 ## Protocol
 
-The client listens for JSON messages from the `watchd` WebSocket server:
+The client listens for JSON messages from the `quay` WebSocket server:
 
 | Message Type  | Fields                     | Description                       |
 |---------------|----------------------------|-----------------------------------|
