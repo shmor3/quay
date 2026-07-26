@@ -117,7 +117,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         std::process::exit(1);
     });
-    let control_addr = format!("{}:{}", bind_addr, control_port);
+    // The control socket is a local admin channel: it always binds loopback,
+    // never the (possibly public) --bind address, so --expose-network cannot
+    // put the reload/diff commands (and the auth token) on the wire. Only the
+    // browser-facing WebSocket server honors --bind/--expose-network.
+    let control_addr = format!("127.0.0.1:{control_port}");
 
     // -----------------------------------------------------------------------
     // Client-mode subcommands (contact a running quay instance and exit)
