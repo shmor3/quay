@@ -7,10 +7,10 @@
 //!
 //! ## Memory safety
 //!
-//! The internal map is periodically pruned to prevent unbounded growth during
-//! long-running sessions.  Entries older than 10× the debounce window are
-//! considered stale and removed every [`prune_interval`](Debouncer::prune_interval)
-//! events.
+//! The `pending` map is self-bounding: [`drain_ready`](Debouncer::drain_ready)
+//! removes each path as soon as it has been quiet for a full `window`, so the
+//! map only holds paths that changed within the last debounce window and cannot
+//! grow without bound during long-running sessions.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -23,8 +23,8 @@ use tracing::warn;
 /// A simple per-path debouncer that suppresses duplicate events within a
 /// configurable time window.
 ///
-/// The internal map is periodically pruned to prevent unbounded growth during
-/// long-running sessions.
+/// The `pending` map is self-bounding: a path is removed as soon as it drains,
+/// so it only ever holds paths changed within the last debounce window.
 pub(crate) struct Debouncer {
     /// Minimum interval between handling the same path.
     pub(crate) window: Duration,

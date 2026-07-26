@@ -79,7 +79,31 @@ impl PathFilter {
 /// Normalize a filesystem path string to use forward slashes so that glob
 /// matching works consistently across platforms.
 pub fn normalize_path(p: &str) -> String {
-    p.replace('\\', "/")
+    // Only Windows uses backslash as a path separator.  On Unix, backslash is a
+    // legal filename byte, so converting it would corrupt real paths.
+    #[cfg(windows)]
+    {
+        p.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_string()
+    }
+}
+
+/// Return `path` expressed relative to `root`, normalized to forward slashes.
+///
+/// `notify` delivers **absolute** paths, but include/exclude globs and config
+/// `watch:` patterns are written relative to the watch root (e.g. `src/**/*.rs`,
+/// `target/**`).  globset anchors non-`**/`-prefixed patterns at the start of
+/// the path, so matching an absolute path against them never succeeds — callers
+/// MUST relativize first.  If `path` is not under `root` (should not happen for
+/// a recursive watch) the normalized absolute path is returned as a fallback.
+pub fn relativize_to_root(path: &Path, root: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(rel) => normalize_path(&rel.to_string_lossy()),
+        Err(_) => normalize_path(&path.to_string_lossy()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +154,47 @@ fn build_glob_set(patterns: &[String]) -> Option<GlobSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path as StdPath;
+
+    #[test]
+    fn relativize_strips_watch_root_prefix() {
+        let root = StdPath::new("/home/dev/proj");
+        assert_eq!(
+            relativize_to_root(StdPath::new("/home/dev/proj/target/debug/foo"), root),
+            "target/debug/foo"
+        );
+        assert_eq!(
+            relativize_to_root(StdPath::new("/home/dev/proj/src/main.rs"), root),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn relativize_path_not_under_root_falls_back_to_normalized() {
+        let root = StdPath::new("/home/dev/proj");
+        assert_eq!(
+            relativize_to_root(StdPath::new("/etc/passwd"), root),
+            "/etc/passwd"
+        );
+    }
+
+    #[test]
+    fn relativize_root_itself_is_empty() {
+        let root = StdPath::new("/home/dev/proj");
+        assert_eq!(relativize_to_root(StdPath::new("/home/dev/proj"), root), "");
+    }
+
+    #[test]
+    fn default_excludes_reject_relativized_absolute_target() {
+        let root = StdPath::new("/home/dev/proj");
+        let filter = PathFilter::with_defaults(&[]);
+        let rel = relativize_to_root(StdPath::new("/home/dev/proj/target/debug/x.o"), root);
+        assert!(!filter.is_allowed(&rel), "target/ artifact must be excluded");
+        let rel_git = relativize_to_root(StdPath::new("/home/dev/proj/.git/index"), root);
+        assert!(!filter.is_allowed(&rel_git), ".git must be excluded");
+        let rel_src = relativize_to_root(StdPath::new("/home/dev/proj/src/main.rs"), root);
+        assert!(filter.is_allowed(&rel_src), "src file must be allowed");
+    }
 
     #[test]
     fn default_excludes_reject_common_dirs() {
@@ -178,7 +243,10 @@ mod tests {
 
     #[test]
     fn normalize_path_converts_backslashes() {
+        #[cfg(windows)]
         assert_eq!(normalize_path(r"a\b\c.txt"), "a/b/c.txt");
+        #[cfg(not(windows))]
+        assert_eq!(normalize_path(r"a\b\c.txt"), r"a\b\c.txt");
         assert_eq!(normalize_path("already/fine"), "already/fine");
     }
 
@@ -207,19 +275,31 @@ mod tests {
 
     #[test]
     fn normalize_path_only_backslashes() {
+        #[cfg(windows)]
         assert_eq!(normalize_path(r"\\\"), "///");
+        #[cfg(not(windows))]
+        assert_eq!(normalize_path(r"\\\"), r"\\\");
     }
 
     #[test]
     fn normalize_path_mixed_separators() {
+        #[cfg(windows)]
         assert_eq!(normalize_path(r"a/b\c/d\e"), "a/b/c/d/e");
+        #[cfg(not(windows))]
+        assert_eq!(normalize_path(r"a/b\c/d\e"), r"a/b\c/d\e");
     }
 
     #[test]
     fn normalize_path_windows_absolute() {
+        #[cfg(windows)]
         assert_eq!(
             normalize_path(r"C:\Users\dev\project\src\main.rs"),
             "C:/Users/dev/project/src/main.rs"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            normalize_path(r"C:\Users\dev\project\src\main.rs"),
+            r"C:\Users\dev\project\src\main.rs"
         );
     }
 
@@ -236,14 +316,23 @@ mod tests {
 
     #[test]
     fn normalize_path_trailing_separator() {
+        #[cfg(windows)]
         assert_eq!(normalize_path(r"dir\subdir\"), "dir/subdir/");
+        #[cfg(not(windows))]
+        assert_eq!(normalize_path(r"dir\subdir\"), r"dir\subdir\");
     }
 
     #[test]
     fn normalize_path_unicode() {
+        #[cfg(windows)]
         assert_eq!(
             normalize_path(r"日本語\パス\ファイル.txt"),
             "日本語/パス/ファイル.txt"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            normalize_path(r"日本語\パス\ファイル.txt"),
+            r"日本語\パス\ファイル.txt"
         );
     }
 

@@ -60,6 +60,25 @@ pub enum WatchdError {
     },
 }
 
+impl WatchdError {
+    /// The optional user-facing, actionable message attached to this error.
+    ///
+    /// The `Display` impl (via `thiserror`) renders the technical cause; callers
+    /// that want to also show the friendlier hint print `user_message()`.
+    pub fn user_message(&self) -> Option<&str> {
+        match self {
+            WatchdError::Io(_, m) | WatchdError::Notify(_, m) | WatchdError::WebSocket(_, m) => {
+                m.as_deref()
+            }
+            WatchdError::ConfigParse { user_message, .. }
+            | WatchdError::InvalidGlob { user_message, .. }
+            | WatchdError::Bind { user_message, .. }
+            | WatchdError::CommandExec { user_message, .. }
+            | WatchdError::ControlConnect { user_message, .. } => user_message.as_deref(),
+        }
+    }
+}
+
 impl From<std::io::Error> for WatchdError {
     fn from(e: std::io::Error) -> Self {
         WatchdError::Io(e, None)

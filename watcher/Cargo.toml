@@ -24,6 +24,9 @@ thiserror = "2"
 similar = "2.6"
 prometheus = "0.13"
 parking_lot = "0.12.5"
+libc = "0.2"
+tokio-rustls = "0.24"
+rustls-pemfile = "1"
 
 [[bin]]
 name = "quay"

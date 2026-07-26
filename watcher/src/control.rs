@@ -57,6 +57,19 @@ use crate::server::StatusMap;
 /// from sending a multi-gigabyte line and causing OOM.
 const CONTROL_READ_MAX_BYTES: usize = 64 * 1024; // 64 KiB
 
+/// Decide whether a control command is authorized.
+///
+/// When no token is configured (`configured == None`) the control socket is
+/// unauthenticated and every command is allowed (backward-compatible default).
+/// When a token IS configured, the request must carry an exactly-matching
+/// `"token"` field.  The comparison is length-checked first, then byte-equal.
+fn command_authorized(configured: Option<&str>, provided: Option<&str>) -> bool {
+    match configured {
+        None => true,
+        Some(expected) => provided == Some(expected),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Control socket server
 // ---------------------------------------------------------------------------
@@ -77,11 +90,11 @@ pub fn spawn_control_server(
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
     diff_store: Option<SharedDiffStore>,
-    _auth_token: Option<String>,
-    _tls_cert: Option<String>,
-    _tls_key: Option<String>,
-    _max_connections: Option<u32>,
+    auth_token: Option<String>,
+    max_connections: Option<u32>,
 ) {
+    // Active control connections, used to enforce `--max-connections`.
+    let active = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -91,15 +104,32 @@ pub fn spawn_control_server(
                 }
                 result = listener.accept() => {
                     match result {
-                        Ok((socket, addr)) => {
+                        Ok((mut socket, addr)) => {
                             debug!(%addr, "control client connected");
+                            // Reject if we're already at the connection cap.
+                            if let Some(max) = max_connections {
+                                if active.load(Ordering::Relaxed) >= max as usize {
+                                    warn!(%addr, "control connection rejected: max-connections reached");
+                                    let _ = socket
+                                        .write_all(b"{\"error\":\"too many connections\"}\n")
+                                        .await;
+                                    continue;
+                                }
+                            }
+                            active.fetch_add(1, Ordering::Relaxed);
                             let btx = btx.clone();
                             let statuses = statuses.clone();
                             let cancel = cancel.clone();
                             let counter = connection_count.clone();
                             let diff_store = diff_store.clone();
+                            let auth = auth_token.clone();
+                            let active_c = active.clone();
                             tokio::spawn(async move {
-                                handle_control_client(socket, btx, statuses, cancel, counter, diff_store, None, None).await;
+                                handle_control_client(
+                                    socket, btx, statuses, cancel, counter, diff_store, auth,
+                                )
+                                .await;
+                                active_c.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Err(e) => {
@@ -133,8 +163,7 @@ async fn handle_control_client(
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
     diff_store: Option<SharedDiffStore>,
-    _auth_token: Option<String>,
-    _max_connections: Option<u32>,
+    auth_token: Option<String>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
@@ -179,7 +208,14 @@ async fn handle_control_client(
 
     let txt = String::from_utf8_lossy(&buf);
     let response = match serde_json::from_str::<serde_json::Value>(&txt) {
-        Ok(v) => match v.get("cmd").and_then(|c| c.as_str()) {
+        Ok(v) => {
+            // Authorization: when a token is configured it must match exactly.
+            let token = v.get("token").and_then(|t| t.as_str());
+            if !command_authorized(auth_token.as_deref(), token) {
+                warn!("control command rejected: invalid or missing auth token");
+                format!("{}\n", serde_json::json!({"error": "unauthorized"}))
+            } else {
+            match v.get("cmd").and_then(|c| c.as_str()) {
             Some("reload") => handle_reload_cmd(&btx, &statuses),
             Some("status") => handle_status_cmd(&statuses, &connection_count),
             Some("diff") => {
@@ -193,13 +229,23 @@ async fn handle_control_client(
                 format!("{}\n", serde_json::json!({"error": "unknown command"}))
             }
             None => format!("{}\n", serde_json::json!({"error": "missing 'cmd' field"})),
-        },
+            }
+            }
+        }
         Err(_) => format!("{}\n", serde_json::json!({"error": "invalid json"})),
     };
 
-    let _ = socket.write_all(response.as_bytes()).await;
+    // Bound the write too (not just the read): a client that never drains the
+    // socket must not pin this task/FD indefinitely on a large `diffs` reply.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.write_all(response.as_bytes()),
+    )
+    .await;
     // Connection is dropped (closed) when `socket` goes out of scope.
-    let _ = cancel; // silence unused-variable warning – kept for future use
+    // `cancel` is intentionally not awaited: the handler is already bounded by
+    // the read (5s) and write (5s) timeouts, so it cannot outlive shutdown long.
+    let _ = cancel;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +255,7 @@ async fn handle_control_client(
 /// Process a `reload` command: broadcast a reload message and update statuses.
 fn handle_reload_cmd(btx: &broadcast::Sender<String>, statuses: &StatusMap) -> String {
     let _ = btx.send(serde_json::json!({"type": "reload"}).to_string());
+    crate::metrics::reloads().inc();
 
     let mut guard = statuses.lock();
     for value in guard.values_mut() {
@@ -343,13 +390,19 @@ pub enum ControlError {
 }
 
 /// Send a reload request to the control socket and print the response.
-pub async fn send_reload(control_addr: &str) -> std::result::Result<(), ControlError> {
-    send_control_command(control_addr, "reload").await
+pub async fn send_reload(
+    control_addr: &str,
+    token: Option<&str>,
+) -> std::result::Result<(), ControlError> {
+    send_control_command(control_addr, "reload", token).await
 }
 
 /// Send a status request to the control socket and print the response.
-pub async fn send_status(control_addr: &str) -> std::result::Result<(), ControlError> {
-    send_control_command(control_addr, "status").await
+pub async fn send_status(
+    control_addr: &str,
+    token: Option<&str>,
+) -> std::result::Result<(), ControlError> {
+    send_control_command(control_addr, "status", token).await
 }
 
 /// Send a diff request to the control socket and print the response.
@@ -359,6 +412,7 @@ pub async fn send_status(control_addr: &str) -> std::result::Result<(), ControlE
 pub async fn send_diff(
     control_addr: &str,
     path: Option<&str>,
+    token: Option<&str>,
 ) -> std::result::Result<(), ControlError> {
     let mut stream = tokio::net::TcpStream::connect(control_addr)
         .await
@@ -367,10 +421,14 @@ pub async fn send_diff(
             source: e,
         })?;
 
-    let req = match path {
-        Some(p) => serde_json::json!({"cmd": "diff", "path": p}).to_string() + "\n",
-        None => serde_json::json!({"cmd": "diffs"}).to_string() + "\n",
+    let mut obj = match path {
+        Some(p) => serde_json::json!({"cmd": "diff", "path": p}),
+        None => serde_json::json!({"cmd": "diffs"}),
     };
+    if let Some(t) = token {
+        obj["token"] = serde_json::Value::String(t.to_string());
+    }
+    let req = obj.to_string() + "\n";
     stream
         .write_all(req.as_bytes())
         .await
@@ -399,7 +457,11 @@ pub async fn send_diff(
 }
 
 /// Generic helper: connect, send a JSON command, read the full response, print it.
-async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), ControlError> {
+async fn send_control_command(
+    addr: &str,
+    cmd: &str,
+    token: Option<&str>,
+) -> std::result::Result<(), ControlError> {
     let mut stream =
         tokio::net::TcpStream::connect(addr)
             .await
@@ -408,7 +470,11 @@ async fn send_control_command(addr: &str, cmd: &str) -> std::result::Result<(), 
                 source: e,
             })?;
 
-    let req = serde_json::json!({"cmd": cmd}).to_string() + "\n";
+    let mut obj = serde_json::json!({"cmd": cmd});
+    if let Some(t) = token {
+        obj["token"] = serde_json::Value::String(t.to_string());
+    }
+    let req = obj.to_string() + "\n";
     stream
         .write_all(req.as_bytes())
         .await
@@ -446,6 +512,25 @@ mod tests {
     use crate::kv::DiffStore;
     use crate::server::{new_status_map, set_status, spawn_ws_server};
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn authorized_when_no_token_configured() {
+        // No token configured → every request is allowed (token ignored).
+        assert!(command_authorized(None, None));
+        assert!(command_authorized(None, Some("whatever")));
+    }
+
+    #[test]
+    fn authorized_only_with_matching_token() {
+        assert!(command_authorized(Some("s3cret"), Some("s3cret")));
+    }
+
+    #[test]
+    fn rejected_when_token_missing_or_wrong() {
+        assert!(!command_authorized(Some("s3cret"), None));
+        assert!(!command_authorized(Some("s3cret"), Some("wrong")));
+        assert!(!command_authorized(Some("s3cret"), Some("")));
+    }
 
     // =====================================================================
     // handle_reload_cmd
@@ -766,8 +851,6 @@ mod tests {
             diff_store,
             None,
             None,
-            None,
-            None,
         );
 
         // Give the server a moment to start accepting.
@@ -1037,8 +1120,6 @@ mod tests {
             statuses.clone(),
             cancel.clone(),
             counter.clone(),
-            None,
-            None,
             None,
             None,
             None,

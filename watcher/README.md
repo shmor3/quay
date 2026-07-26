@@ -197,7 +197,12 @@ quay [OPTIONS] [CMD_TEMPLATE]
 | `[CMD_TEMPLATE]`          | `echo files changed` | Command to run on changes. Use `{path}` for the changed file path |
 | `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `quay.yaml`         |
 | `--port <PORT>`           | `3012`               | WebSocket server port                                             |
-| `--bind <ADDR>`           | `127.0.0.1`          | Address to bind the WebSocket and control servers to              |
+| `--bind <ADDR>`           | `127.0.0.1`          | Address for the WebSocket and metrics servers (control socket is always loopback) |
+| `--expose-network`        |                      | Allow `--bind` to use a non-loopback address                      |
+| `--auth-token <TOKEN>`    |                      | Require this token on every control-socket command                |
+| `--tls-cert <PATH>` / `--tls-key <PATH>` |           | Enable `wss://` on the WebSocket server (both required)           |
+| `--max-connections <N>`   |                      | Cap concurrent WebSocket and control connections                  |
+| `--max-memory-mb <MB>` / `--max-cpu-seconds <S>` |    | Resource limits for spawned commands (`setrlimit`, Unix)          |
 | `--debounce-ms <MS>`      | `200`                | Debounce delay in milliseconds                                    |
 | `--no-run-on-start`       |                      | Do not run configured commands on startup                         |
 | `--cmd-timeout-ms <MS>`   |                      | Maximum time to wait for a command before killing it              |
@@ -436,9 +441,10 @@ If a command exceeds the timeout, the process is killed and the worker continues
 ## Security considerations
 
 - **Shell escaping** — file paths are escaped before interpolation into command templates to prevent injection
-- **Local-only by default** — both the WebSocket server and control socket bind to `127.0.0.1`
-- **No authentication** — the control socket has no authentication mechanism; keep it local-only
-- **No TLS** — traffic is unencrypted; use a reverse proxy for network-exposed deployments
+- **Loopback control socket** — the control socket always binds `127.0.0.1`, never `--bind`, so `--expose-network` cannot expose it
+- **Optional control auth** — `--auth-token <TOKEN>` requires a matching `"token"` on every control command (off by default)
+- **Optional TLS** — `--tls-cert`/`--tls-key` serve the WebSocket server over `wss://` (both required together); otherwise traffic is plaintext, suitable for local use
+- **Connection cap & resource limits** — `--max-connections`, and `--max-memory-mb`/`--max-cpu-seconds` (`setrlimit`, Unix) bound resource use; command timeouts kill the whole process group
 - **WebSocket handshake timeout** — 10-second timeout prevents resource exhaustion from raw TCP connections
 - **Control socket size limit** — 64 KiB maximum request size prevents memory exhaustion
 
@@ -447,7 +453,7 @@ If a command exceeds the timeout, the process is killed and the worker continues
 - **Worker quayog** — a background task monitors the file-watcher worker thread and initiates coordinated shutdown if it terminates unexpectedly
 - **Panic recovery** — individual event handlers are wrapped in `catch_unwind` so one bad path doesn't kill the worker
 - **Accept error resilience** — both WebSocket and control socket handle `accept()` errors with 1-second backoff and retry
-- **Debouncer pruning** — stale entries are periodically pruned to prevent unbounded memory growth
+- **Self-bounding debouncer** — each path is dropped from the pending map once it drains, so the map only holds recently-changed paths (no unbounded growth)
 - **Lock poisoning** — all mutex operations handle lock poisoning gracefully with warnings rather than panics
 - **Process supervisor integration** — the quayog ensures clean exit on worker failure, compatible with systemd/Docker restart policies
 
