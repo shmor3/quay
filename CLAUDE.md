@@ -18,12 +18,13 @@ quay/
 │   │   ├── command.rs      # Shell escaping and blocking command execution (canonical impl)
 │   │   ├── config.rs       # YAML config parsing (serde), uses command::shell_escape
 │   │   ├── control.rs      # TCP control socket server, command handlers, client helpers
-│   │   ├── debounce.rs     # Per-path event debouncer with periodic pruning
+│   │   ├── debounce.rs     # Per-path event debouncer (self-bounding pending map)
 │   │   ├── error.rs        # Centralised error type (WatchdError, thiserror)
 │   │   ├── filter.rs       # Glob-based include/exclude path filtering (globset)
 │   │   ├── health.rs       # Worker thread health monitoring / quayog
 │   │   ├── kv.rs           # Bounded in-memory diff store (similar crate)
 │   │   ├── server.rs       # WebSocket server, status map infrastructure
+│   │   ├── metrics.rs      # Prometheus metrics (single default registry)
 │   │   ├── validate.rs     # Input validation helpers for CLI arguments
 │   │   └── watcher.rs      # File-system watcher, event handling, worker context
 │   └── README.md           # Detailed watcher documentation
@@ -90,6 +91,10 @@ cargo test --manifest-path watcher/Cargo.toml -- --test-threads=4
 - `similar 2.6` — text diffing for the in-memory diff store
 - `base64 0.22` — encoding CSS content for injection messages
 - `futures 0.3` — stream/sink extensions for WebSocket handling
+- `prometheus 0.13` — metrics registry + text exposition
+- `tokio-rustls 0.24` + `rustls-pemfile 1` — optional TLS for the WebSocket server
+- `libc 0.2` — `setrlimit` and process-group kill for spawned commands (Unix)
+- `parking_lot 0.12` — non-poisoning mutexes for the status/diff maps
 
 ### Architecture Patterns
 - **Async Tokio tasks** for WebSocket server and control socket
@@ -97,7 +102,7 @@ cargo test --manifest-path watcher/Cargo.toml -- --test-threads=4
 - **Graceful shutdown** via Ctrl-C with `CancellationToken` (tokio-util) propagated to all tasks
 - **Worker quayog** (`health.rs`) — background Tokio task polls the worker thread's `JoinHandle`; triggers shutdown if the thread dies
 - **Panic recovery** — individual event handlers are wrapped in `catch_unwind` so one bad path doesn't kill the worker
-- **Debounced file events** — configurable debounce delay with periodic pruning of stale entries
+- **Debounced file events** — configurable debounce delay; the pending map is self-bounding (each path drops once it drains)
 - **Config hot-reload** — editing `quay.yaml` at the watch root reloads without restart
 - **Control socket** on port+1 for CLI subcommands (`status`, `reload`, `diff`, `diffs`, `diff-clear`)
 
@@ -117,9 +122,10 @@ cargo test --manifest-path watcher/Cargo.toml -- --test-threads=4
 
 ### Security Model
 - Shell escaping prevents command injection via `{path}` placeholder
-- Control socket has **no authentication** — local-only by default (`127.0.0.1`)
+- Control socket **always binds loopback** (`127.0.0.1`), never `--bind`, so `--expose-network` can't expose it; unauthenticated by default, or require a token with `--auth-token`
 - WebSocket handshake timeout (10s) prevents resource exhaustion from raw TCP connections
 - Control socket read timeout (5s) and size limit (64 KiB) prevent slow/malicious clients
+- Optional `--auth-token` enforces a matching `"token"` on every control command; optional `--tls-cert`/`--tls-key` serve the WebSocket server over `wss://` (both required together); optional `--max-connections` caps concurrent connections; `--max-memory-mb`/`--max-cpu-seconds` apply `setrlimit` to spawned commands (Unix), which also run in their own process group so a timeout kills the whole tree
 - Lock poisoning handled gracefully with warnings (no panics)
 - Accept errors trigger 1s backoff and retry (no crash loops)
 

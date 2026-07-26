@@ -23,6 +23,10 @@ A minimal, language-agnostic file watcher that runs commands when files change a
 - **Graceful shutdown** via Ctrl-C with coordinated cancellation across all tasks
 - **Structured logging** via `tracing` (configurable with `RUST_LOG` environment variable)
 - **Self-healing** — accept errors on WebSocket and control sockets trigger a 1-second backoff and retry rather than crashing; the worker thread catches panics in individual event handlers and continues processing
+- **Optional TLS** (`--tls-cert`/`--tls-key`) for the WebSocket server, with the embedded client auto-selecting `wss://` on HTTPS pages
+- **Optional control-socket auth** (`--auth-token`) and a concurrent-connection cap (`--max-connections`); the control socket is always loopback-only
+- **Command resource limits** (`--max-memory-mb`/`--max-cpu-seconds`) via `setrlimit`, and process-group termination so a timeout kills the whole command tree (Unix)
+- **Prometheus metrics** at `http://<bind>:9090/metrics` — health, WebSocket connections, reload count, and tracked-diff count
 
 ## Quick start
 
@@ -120,13 +124,20 @@ quay [OPTIONS] [CMD_TEMPLATE]
 | `[CMD_TEMPLATE]`          | `echo files changed` | Command to run on changes. Use `{path}` for the changed file path |
 | `-p, --path <PATH>`       | `.`                  | Directory to watch and where to look for `quay.yaml`         |
 | `--port <PORT>`           | `3012`               | WebSocket server port                                             |
-| `--bind <ADDR>`           | `127.0.0.1`          | Address to bind the WebSocket and control servers to              |
+| `--bind <ADDR>`           | `127.0.0.1`          | Address for the WebSocket and metrics servers (the control socket is always loopback) |
 | `--debounce-ms <MS>`      | `200`                | Debounce delay in milliseconds                                    |
 | `--no-run-on-start`       |                      | Do not run configured commands on startup                         |
 | `--cmd-timeout-ms <MS>`   |                      | Maximum time to wait for a command before killing it              |
 | `--print-snippet`         |                      | Print the HTML `<script>` snippet for embedding the client, then exit |
 | `--diff`                  |                      | Enable the in-memory diff store for file change tracking          |
 | `--diff-max-file-size <B>`| `524288`             | Maximum file size (bytes) the diff store will process (ignored without `--diff`) |
+| `--expose-network`        |                      | Allow `--bind` to use a non-loopback address (e.g. `0.0.0.0`)     |
+| `--auth-token <TOKEN>`    |                      | Require this token on every control-socket command                |
+| `--tls-cert <PATH>`       |                      | PEM certificate; enables `wss://` on the WebSocket server (needs `--tls-key`) |
+| `--tls-key <PATH>`        |                      | PEM private key paired with `--tls-cert`                          |
+| `--max-connections <N>`   |                      | Cap on concurrent WebSocket and control connections               |
+| `--max-memory-mb <MB>`    |                      | Memory limit (`RLIMIT_AS`) applied to spawned commands (Unix)     |
+| `--max-cpu-seconds <S>`   |                      | CPU-time limit (`RLIMIT_CPU`) applied to spawned commands (Unix)  |
 
 ### Client-mode subcommands
 
@@ -217,7 +228,7 @@ The browser client will:
 
 Implementing a quay client in any language is straightforward:
 
-1. Open a WebSocket connection to `ws://localhost:3012`.
+1. Open a WebSocket connection to `ws://localhost:3012` (use `wss://` when the server runs with `--tls-cert`/`--tls-key`).
 2. Listen for incoming text messages.
 3. Parse each message as JSON.
 4. Inspect the `type` field:
@@ -489,15 +500,29 @@ By default, quay binds to `127.0.0.1` (localhost only). This means:
 - The WebSocket server is accessible only from the local machine.
 - The control socket is accessible only from the local machine.
 
-If you bind to `0.0.0.0` or `::`, both the WebSocket server and the control socket become accessible from other machines on the network. **Do not do this in untrusted environments** without adding an authentication layer.
+The WebSocket (and metrics) servers bind to `--bind`; `--bind 0.0.0.0` (which also
+requires `--expose-network`) exposes them to the network. **Do not do this in
+untrusted environments** without `--tls-*` and a browser-side auth layer. The
+**control socket always stays on loopback** regardless of `--bind`, so it is never
+network-exposed.
 
 ### Control socket authentication
 
-The control socket has **no authentication**. Any process on the local machine can send commands (reload, status, diff, diff-clear). This is acceptable for a development tool but should be considered if deploying in shared environments.
+The control socket binds to loopback **only** and never to `--bind`, so
+`--expose-network` cannot put the reload/status/diff commands on the wire. By
+default it has no authentication — any local process can send commands. Pass
+`--auth-token <TOKEN>` to require a matching `"token"` field on every command;
+client subcommands forward it when invoked with the same `--auth-token` (e.g.
+`quay --port 3012 --auth-token secret status`).
 
-### No TLS
+### TLS
 
-All communication (WebSocket and control socket) is unencrypted plaintext. This is appropriate for local development but should not be used over untrusted networks without a TLS-terminating proxy.
+By default all traffic is plaintext, which is appropriate for local development.
+To encrypt the browser-facing WebSocket server, pass `--tls-cert <cert.pem>` and
+`--tls-key <key.pem>`: quay then serves `wss://` (the embedded client automatically
+uses `wss://` on HTTPS pages) and refuses plaintext connections. Both flags are
+required together. The control socket is loopback-only (see above) and is not
+TLS-wrapped; front it with an SSH tunnel or reverse proxy for remote control.
 
 ### Command injection prevention
 
@@ -510,6 +535,25 @@ A 10-second timeout is applied to the WebSocket handshake to prevent raw TCP con
 ### Control socket size limit
 
 The control socket limits incoming requests to 64 KiB to prevent denial-of-service attacks via memory exhaustion.
+
+## Metrics
+
+quay exposes Prometheus metrics over HTTP on port `9090` of the `--bind` address
+(so `http://127.0.0.1:9090/metrics` by default):
+
+```bash
+curl http://127.0.0.1:9090/metrics
+```
+
+| Metric                | Type    | Meaning                                      |
+|-----------------------|---------|----------------------------------------------|
+| `quay_health`         | gauge   | `1` while the watcher worker thread is alive |
+| `quay_ws_connections` | gauge   | Current connected WebSocket clients          |
+| `quay_reload_count`   | counter | Total reload / inject-css messages broadcast |
+| `quay_diff_count`     | gauge   | Files currently tracked in the diff store    |
+
+If port `9090` is already in use, quay logs a warning and continues without the
+endpoint. The endpoint shuts down with the rest of the process on Ctrl-C.
 
 ## Recovery and Self-Healing
 
