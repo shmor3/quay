@@ -23,7 +23,6 @@
 //! negligible in practice.
 
 use parking_lot::Mutex;
-use prometheus::IntGauge;
 use similar::TextDiff;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -106,8 +105,6 @@ pub struct DiffStore {
     /// Files larger than this produce a placeholder entry and their content
     /// is **not** stored as a snapshot.
     max_file_size: usize,
-    /// Prometheus gauge for diff count
-    diff_gauge: IntGauge,
 }
 
 impl std::fmt::Debug for DiffStore {
@@ -143,12 +140,6 @@ impl DiffStore {
         let capacity = capacity.max(1);
         let max_keys = max_keys.max(1);
         let max_file_size = max_file_size.max(1);
-        let diff_gauge =
-            IntGauge::new("quay_diff_count", "Total diffs in store").unwrap_or_else(|e| {
-                warn!("Failed to create metric: {}", e);
-                IntGauge::new("fallback_diff", "fallback")
-                    .expect("fallback metric creation should never fail")
-            });
         Self {
             diffs: HashMap::new(),
             snapshots: HashMap::new(),
@@ -156,7 +147,6 @@ impl DiffStore {
             capacity,
             max_keys,
             max_file_size,
-            diff_gauge,
         }
     }
 
@@ -208,6 +198,10 @@ impl DiffStore {
         let old_size = old_content.as_ref().map_or(0, Vec::len);
 
         let (diff_text, binary) = compute_diff(path, old_content.as_deref(), new_content);
+        // Identical re-save (empty diff) — don't churn the bounded ring.
+        if diff_text.is_empty() {
+            return None;
+        }
 
         let entry = DiffEntry {
             path: path.to_string(),
@@ -224,9 +218,6 @@ impl DiffStore {
             .insert(path.to_string(), new_content.to_vec());
 
         self.insert_entry(path, entry.clone());
-
-        self.diff_gauge
-            .set(self.diffs.values().map(|v| v.len() as i64).sum());
         Some(entry)
     }
 
@@ -352,6 +343,10 @@ impl DiffStore {
 
         let old_size = old_content.as_ref().map_or(0, Vec::len);
         let (diff_text, binary) = compute_diff(normalized, old_content.as_deref(), &content);
+        // Identical re-save (empty diff) — don't churn the bounded ring.
+        if diff_text.is_empty() {
+            return None;
+        }
 
         let entry = DiffEntry {
             path: normalized.to_string(),
@@ -366,9 +361,6 @@ impl DiffStore {
         let mut store = store_mutex.lock();
         store.snapshots.insert(normalized.to_string(), content);
         store.insert_entry(normalized, entry.clone());
-        store
-            .diff_gauge
-            .set(store.diffs.values().map(|v| v.len() as i64).sum());
 
         Some(entry)
     }
@@ -429,6 +421,7 @@ impl DiffStore {
         self.diffs.clear();
         self.snapshots.clear();
         self.key_order.clear();
+        crate::metrics::diff_count().set(self.diffs.len() as i64);
         debug!("diff store cleared");
     }
 
@@ -438,6 +431,7 @@ impl DiffStore {
         let existed = self.diffs.remove(path).is_some();
         self.snapshots.remove(path);
         self.key_order.retain(|k| k != path);
+        crate::metrics::diff_count().set(self.diffs.len() as i64);
         existed
     }
 
@@ -469,6 +463,7 @@ impl DiffStore {
             ring.pop_front();
         }
         ring.push_back(entry);
+        crate::metrics::diff_count().set(self.diffs.len() as i64);
     }
 }
 
@@ -626,12 +621,12 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_content_produces_empty_diff() {
+    fn unchanged_content_produces_no_entry() {
         let mut store = make_store(5, 10);
-        store.record_change("a.txt", b"hello\n");
-        let entry = store.record_change("a.txt", b"hello\n").unwrap();
-        assert!(entry.diff.is_empty());
-        assert!(!entry.truncated);
+        let first = store.record_change("a.txt", b"hello\n");
+        assert!(first.is_some(), "first write is recorded");
+        // Identical re-save → empty diff → no new entry (bounded ring not churned).
+        assert!(store.record_change("a.txt", b"hello\n").is_none());
     }
 
     #[test]
@@ -1211,12 +1206,11 @@ mod tests {
     }
 
     #[test]
-    fn record_change_empty_content() {
+    fn record_change_empty_content_records_nothing() {
         let mut store = make_store(5, 10);
-        let entry = store.record_change("f.txt", b"").unwrap();
-        assert!(entry.diff.is_empty());
-        assert_eq!(entry.new_size, 0);
-        assert!(!entry.truncated);
+        // Empty content yields an empty diff, so no entry is recorded.
+        assert!(store.record_change("f.txt", b"").is_none());
+        assert!(store.get_latest("f.txt").is_none());
     }
 
     #[test]

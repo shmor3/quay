@@ -447,7 +447,7 @@ If a command exceeds the timeout, the process is killed and the worker continues
 - **Worker quayog** — a background task monitors the file-watcher worker thread and initiates coordinated shutdown if it terminates unexpectedly
 - **Panic recovery** — individual event handlers are wrapped in `catch_unwind` so one bad path doesn't kill the worker
 - **Accept error resilience** — both WebSocket and control socket handle `accept()` errors with 1-second backoff and retry
-- **Debouncer pruning** — stale entries are periodically pruned to prevent unbounded memory growth
+- **Self-bounding debouncer** — each path is dropped from the pending map once it drains, so the map only holds recently-changed paths (no unbounded growth)
 - **Lock poisoning** — all mutex operations handle lock poisoning gracefully with warnings rather than panics
 - **Process supervisor integration** — the quayog ensures clean exit on worker failure, compatible with systemd/Docker restart policies
 

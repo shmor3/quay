@@ -533,7 +533,7 @@ Both the WebSocket server and control socket handle `accept()` errors (e.g. `EMF
 
 ### Debouncer memory management
 
-The per-path debouncer periodically prunes stale entries (older than 10× the debounce window) every 1000 events to prevent unbounded memory growth during long-running sessions.
+The per-path debouncer is self-bounding: each path is removed from the pending map as soon as it has been quiet for a full debounce window, so the map only ever holds paths changed within the last window and cannot grow without bound.
 
 ### Lock poisoning
 

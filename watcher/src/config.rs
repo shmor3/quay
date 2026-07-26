@@ -58,6 +58,7 @@ impl NotifyMode {
 
 /// Intermediate representation that serde deserializes directly from YAML.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default = "default_name")]
     name: String,
@@ -182,17 +183,42 @@ impl ConfigEntry {
 ///
 /// Invalid entries are logged and skipped rather than failing the entire parse.
 pub fn parse_configs(yaml: &str) -> Vec<ConfigEntry> {
-    // Try as a sequence first, then as a single mapping.
-    if let Ok(raw_list) = serde_yml::from_str::<Vec<RawConfig>>(yaml) {
-        return raw_list.into_iter().map(ConfigEntry::from).collect();
+    if yaml.trim().is_empty() {
+        return Vec::new();
     }
 
-    if let Ok(raw) = serde_yml::from_str::<RawConfig>(yaml) {
-        return vec![ConfigEntry::from(raw)];
-    }
+    // Parse to a generic value first so a single malformed entry only drops
+    // *itself* (with a logged reason) rather than discarding every config.
+    let value: serde_yml::Value = match serde_yml::from_str(yaml) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to parse quay.yaml as YAML; no configs loaded");
+            return Vec::new();
+        }
+    };
 
-    warn!("failed to parse quay.yaml as YAML; no configs loaded");
-    Vec::new()
+    let mut configs = Vec::new();
+    match value {
+        serde_yml::Value::Sequence(items) => {
+            for (idx, item) in items.into_iter().enumerate() {
+                match serde_yml::from_value::<RawConfig>(item) {
+                    Ok(raw) => configs.push(ConfigEntry::from(raw)),
+                    Err(e) => warn!(
+                        index = idx,
+                        error = %e,
+                        "skipping invalid config entry in quay.yaml"
+                    ),
+                }
+            }
+        }
+        // Empty document / comments-only / explicit null → no configs.
+        serde_yml::Value::Null => {}
+        other => match serde_yml::from_value::<RawConfig>(other) {
+            Ok(raw) => configs.push(ConfigEntry::from(raw)),
+            Err(e) => warn!(error = %e, "failed to parse quay.yaml config; no configs loaded"),
+        },
+    }
+    configs
 }
 
 /// Normalize a glob pattern by converting backslashes to forward slashes.
@@ -808,17 +834,20 @@ ignore:
     // -- YAML with extra/unknown fields ------------------------------------
 
     #[test]
-    fn unknown_yaml_fields_ignored() {
+    fn unknown_yaml_fields_reject_only_that_entry() {
+        // deny_unknown_fields catches typo'd keys. The bad entry is dropped
+        // (with a logged reason) but a valid sibling still loads — the parse is
+        // per-entry lenient, not all-or-nothing.
         let yaml = r#"
-name: flexible
-watch: "**/*.rs"
-unknown_field: "should be ignored"
-another_extra: 42
+- name: good
+  watch: "**/*.rs"
+- name: typo
+  watch: "**/*.css"
+  on-change: "echo hi"
 "#;
-        // serde(deny_unknown_fields) is NOT set, so this should parse fine.
         let configs = parse_configs(yaml);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name, "flexible");
+        assert_eq!(configs.len(), 1, "only the valid entry should survive");
+        assert_eq!(configs[0].name, "good");
     }
 
     // -- deserialize_string_or_vec edge cases ------------------------------

@@ -166,9 +166,10 @@ pub fn validate_debounce_ms(ms: u64) -> Result<(), String> {
 pub fn validate_cmd_timeout_ms(ms: Option<u64>) -> Result<(), String> {
     if let Some(timeout) = ms {
         if timeout == 0 {
-            warn!(
-                "command timeout of 0ms will kill commands immediately; \
-                 this is almost certainly not what you want"
+            return Err(
+                "command timeout of 0ms would kill every command immediately; \
+                 use a positive value or omit --cmd-timeout-ms for no timeout."
+                    .to_string(),
             );
         }
 
@@ -218,28 +219,19 @@ pub fn validate_diff_flags(diff_enabled: bool, diff_max_file_size: usize) {
     }
 }
 
-#[allow(dead_code)]
-pub fn validate_auth_token(token: Option<&str>) -> Result<(), String> {
-    if token.is_none() {
-        return Err("auth_token is required for secure operation".to_string());
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
+/// Validate TLS flags: cert and key must be supplied together (or neither).
 pub fn validate_tls(cert: Option<&str>, key: Option<&str>) -> Result<(), String> {
-    if cert.is_none() || key.is_none() {
-        return Err("TLS certificate and key are required for secure operation".to_string());
+    match (cert, key) {
+        (Some(_), None) => Err("--tls-cert requires --tls-key".to_string()),
+        (None, Some(_)) => Err("--tls-key requires --tls-cert".to_string()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-#[allow(dead_code)]
+/// Validate that `--max-connections`, if set, is greater than zero.
 pub fn validate_max_connections(max: Option<u32>) -> Result<(), String> {
-    if let Some(m) = max {
-        if m == 0 {
-            return Err("max_connections must be greater than zero".to_string());
-        }
+    if max == Some(0) {
+        return Err("--max-connections must be greater than zero".to_string());
     }
     Ok(())
 }
@@ -441,8 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn cmd_timeout_zero_accepted_with_warning() {
-        assert!(validate_cmd_timeout_ms(Some(0)).is_ok());
+    fn cmd_timeout_zero_rejected() {
+        // 0ms would kill every command instantly — reject like --debounce-ms 0.
+        assert!(validate_cmd_timeout_ms(Some(0)).is_err());
     }
 
     #[test]

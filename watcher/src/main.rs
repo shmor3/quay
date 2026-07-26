@@ -33,12 +33,13 @@ mod error;
 mod filter;
 mod health;
 mod kv;
+mod metrics;
 mod server;
 mod validate;
 mod watcher;
 
 use clap::Parser;
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, TextEncoder};
 use std::fs;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -58,18 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_target(false)
         .init();
 
-    // Prometheus metrics setup
-    let registry = Registry::new();
-    let health_gauge = IntGauge::new("quay_health", "Health status of quay")
-        .expect("failed to create health gauge");
-    let reload_counter = IntCounter::new("quay_reload_count", "Reload events")
-        .expect("failed to create reload counter");
-    registry
-        .register(Box::new(health_gauge.clone()))
-        .expect("failed to register health gauge");
-    registry
-        .register(Box::new(reload_counter.clone()))
-        .expect("failed to register reload counter");
+    // Prometheus metrics live in the `metrics` module (default registry); they
+    // are registered lazily on first use and served by the endpoint below.
 
     let args = cli::Args::parse();
     let cmd_template = args.cmd_template.clone();
@@ -106,6 +97,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     validate::warn_port_issues(args.port);
     validate::validate_diff_flags(args.diff, args.diff_max_file_size);
 
+    if let Err(msg) = validate::validate_tls(args.tls_cert.as_deref(), args.tls_key.as_deref()) {
+        error!("{msg}");
+        std::process::exit(1);
+    }
+
+    if let Err(msg) = validate::validate_max_connections(args.max_connections) {
+        error!("{msg}");
+        std::process::exit(1);
+    }
+
     // The control socket lives on port + 1.  Guard against overflow so that
     // port 65535 doesn't silently wrap to 0 (debug panic / release wrap).
     let control_port = args.port.checked_add(1).unwrap_or_else(|| {
@@ -124,19 +125,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(sub) = &args.subcmd {
         match sub {
             cli::Subcommand::Reload => {
-                if let Err(e) = control::send_reload(&control_addr).await {
+                if let Err(e) =
+                    control::send_reload(&control_addr, args.auth_token.as_deref()).await
+                {
                     error!("{e}");
                     std::process::exit(1);
                 }
             }
             cli::Subcommand::Status => {
-                if let Err(e) = control::send_status(&control_addr).await {
+                if let Err(e) =
+                    control::send_status(&control_addr, args.auth_token.as_deref()).await
+                {
                     error!("{e}");
                     std::process::exit(1);
                 }
             }
             cli::Subcommand::Diff { path } => {
-                if let Err(e) = control::send_diff(&control_addr, path.as_deref()).await {
+                if let Err(e) =
+                    control::send_diff(&control_addr, path.as_deref(), args.auth_token.as_deref())
+                        .await
+                {
                     error!("{e}");
                     std::process::exit(1);
                 }
@@ -237,15 +245,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind WebSocket and control listeners before starting the watcher so that
     // failures surface immediately rather than after everything is running.
     let ws_addr = format!("{}:{}", bind_addr, args.port);
-    let ws_listener = TcpListener::bind(&ws_addr)
-        .await
-        .map_err(|e| error::WatchdError::Bind {
-            addr: ws_addr.clone(),
-            source: e,
-            user_message: Some(
-                "Failed to bind WebSocket server. Check address and port.".to_string(),
-            ),
-        })?;
+    let ws_listener = match TcpListener::bind(&ws_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let err = error::WatchdError::Bind {
+                addr: ws_addr.clone(),
+                source: e,
+                user_message: Some(
+                    "Failed to bind WebSocket server. Check address and port.".to_string(),
+                ),
+            };
+            error!("{err}");
+            if let Some(hint) = err.user_message() {
+                eprintln!("Actionable guidance: {hint}");
+            }
+            std::process::exit(1);
+        }
+    };
     info!(addr = %ws_addr, "WebSocket server listening");
 
     let ctrl_listener =
@@ -282,43 +298,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cancel.clone(),
         connection_count.clone(),
         diff_store.clone(),
-        args.auth_token.clone(), // auth_token
-        args.tls_cert.clone(),   // tls_cert
-        args.tls_key.clone(),    // tls_key
-        args.max_connections,    // max_connections
+        args.auth_token.clone(),
+        args.max_connections,
     );
 
-    // Health/readiness endpoint
-    let registry_clone = registry.clone();
+    // Metrics / health endpoint — Prometheus text format over real HTTP.
+    // Honors --bind (previously hardcoded 127.0.0.1) and shuts down with cancel.
+    // Touch every metric once at startup so all four are present in the very
+    // first `/metrics` scrape rather than only appearing after first use.
+    metrics::health().set(1);
+    metrics::ws_connections().set(0);
+    metrics::diff_count();
+    let _ = metrics::reloads();
+    let metrics_addr = format!("{bind_addr}:9090");
+    let metrics_cancel = cancel.clone();
     tokio::spawn(async move {
-        let health_addr = "127.0.0.1:9090";
-        let listener = match TcpListener::bind(health_addr).await {
+        let listener = match TcpListener::bind(&metrics_addr).await {
             Ok(l) => l,
             Err(e) => {
-                warn!(addr = %health_addr, error = %e, "failed to bind health endpoint; running without it");
+                warn!(addr = %metrics_addr, error = %e, "failed to bind metrics endpoint; running without it");
                 return;
             }
         };
-        info!(addr = %health_addr, "health endpoint listening");
+        info!(addr = %metrics_addr, "metrics endpoint listening (GET /metrics)");
         loop {
-            let (mut socket, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "health endpoint accept failed");
-                    continue;
-                }
+            let (mut socket, _) = tokio::select! {
+                () = metrics_cancel.cancelled() => break,
+                res = listener.accept() => match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "metrics endpoint accept failed");
+                        continue;
+                    }
+                },
             };
-            let mut buffer = Vec::new();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Consume the request so the client's write completes before we reply.
+            let mut scratch = [0u8; 1024];
+            let _ = socket.read(&mut scratch).await;
+
+            let mut body = Vec::new();
             let encoder = TextEncoder::new();
-            let mf = registry_clone.gather();
-            if let Err(e) = encoder.encode(&mf, &mut buffer) {
-                warn!(error = %e, "failed to encode prometheus metrics");
+            let mf = prometheus::default_registry().gather();
+            if encoder.encode(&mf, &mut body).is_err() {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
                 continue;
             }
-            use tokio::io::AsyncWriteExt;
-            if let Err(e) = socket.write_all(&buffer).await {
-                warn!(error = %e, "failed to write to health endpoint socket");
-            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                encoder.format_type(),
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
         }
     });
 
@@ -336,6 +370,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         statuses,
         cancel: cancel.clone(),
         cmd_timeout_ms: args.cmd_timeout_ms,
+        max_memory_mb: args.max_memory_mb,
+        max_cpu_seconds: args.max_cpu_seconds,
         connection_count,
         diff_store,
     })?;
@@ -345,12 +381,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // coordinated shutdown so the server doesn't run in a degraded state.
     let _watchdog = health::WorkerWatchdog::new(worker_handle, cancel.clone()).spawn();
 
-    // Wait for Ctrl-C to initiate graceful shutdown.
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => info!("received Ctrl-C; shutting down"),
-        Err(e) => {
-            error!(error = %e, "failed to listen for Ctrl-C");
-            eprintln!("Actionable guidance: Unable to listen for Ctrl-C. Try running with proper terminal permissions.");
+    // Wait for either Ctrl-C or an internally-triggered shutdown (e.g. the
+    // worker watchdog cancelling the token after the worker thread dies).
+    // Awaiting only Ctrl-C would leave a zombie process: watcher dead, servers
+    // stopped, but the process still "up" so a supervisor never restarts it.
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => match result {
+            Ok(()) => info!("received Ctrl-C; shutting down"),
+            Err(e) => {
+                error!(error = %e, "failed to listen for Ctrl-C");
+                eprintln!("Actionable guidance: Unable to listen for Ctrl-C. Try running with proper terminal permissions.");
+            }
+        },
+        () = cancel.cancelled() => {
+            warn!("shutdown triggered internally (worker watchdog); exiting");
         }
     }
 
