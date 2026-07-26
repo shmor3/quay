@@ -59,7 +59,32 @@ pub const CLIENT_JS: &str = r#"(function(){
     }
   }
 
+  function cssBasename(p) {
+    p = String(p).split("?")[0];
+    var i = p.lastIndexOf("/");
+    return i >= 0 ? p.slice(i + 1) : p;
+  }
+
   function injectCSS(path, encodedContent) {
+    // Prefer reloading a matching <link>: re-fetching the file from disk applies
+    // additions AND deletions.  A layered <style> can only add/override rules,
+    // so a deleted rule would silently persist.
+    var base = cssBasename(path);
+    var links = document.querySelectorAll('link[rel="stylesheet"]');
+    var matched = false;
+    for (var i = 0; i < links.length; i++) {
+      var href = links[i].getAttribute("href");
+      if (href && cssBasename(href) === base) {
+        var clean = href.split("?")[0];
+        links[i].setAttribute("href", clean + "?quay=" + Date.now());
+        matched = true;
+        log("reloaded stylesheet " + base);
+      }
+    }
+    if (matched) return;
+
+    // Fallback (no matching <link>, e.g. inline styling): inject/replace a
+    // <style> block keyed by path.
     var css = b64decode(encodedContent);
     var existing = document.querySelector('style[data-quay="' + CSS.escape(path) + '"]');
     if (existing) {
@@ -76,7 +101,8 @@ pub const CLIENT_JS: &str = r#"(function(){
 
   function connect() {
     var host = location.hostname || "localhost";
-    var url = "ws://" + host + ":" + port;
+    var proto = (location.protocol === "https:") ? "wss://" : "ws://";
+    var url = proto + host + ":" + port;
     log("connecting to " + url);
 
     var ws;

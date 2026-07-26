@@ -68,6 +68,10 @@ pub struct WatcherParams {
     pub cancel: CancellationToken,
     /// Optional per-command timeout in milliseconds.
     pub cmd_timeout_ms: Option<u64>,
+    /// Optional resource limits for spawned build commands (Unix only; ignored
+    /// on other platforms with a one-time warning).
+    pub max_memory_mb: Option<u32>,
+    pub max_cpu_seconds: Option<u32>,
     /// Shared counter of active WebSocket connections (for status reporting).
     pub connection_count: Arc<AtomicUsize>,
     /// Optional diff store.  When `Some`, file diffs are recorded on every
@@ -211,6 +215,7 @@ fn notify_clients(
 fn broadcast_reload(btx: &broadcast::Sender<String>, normalized: &str, label: &str) {
     let msg = serde_json::json!({"type": "reload"}).to_string();
     let _ = btx.send(msg);
+    crate::metrics::reloads().inc();
     info!(path = normalized, config = label, "broadcast reload");
 }
 
@@ -230,6 +235,7 @@ fn broadcast_inject_css(
             })
             .to_string();
             let _ = btx.send(msg);
+            crate::metrics::reloads().inc();
             info!(path = normalized, config = label, "broadcast inject-css");
         }
         Err(e) => {
@@ -297,8 +303,14 @@ struct WorkerContext {
     cmd_template: String,
     debouncer: Debouncer,
     cmd_timeout: Option<Duration>,
+    /// Optional resource limits applied to spawned build commands (Unix only).
+    max_memory_mb: Option<u32>,
+    max_cpu_seconds: Option<u32>,
     /// Absolute path to `quay.yaml` (used for config hot-reload detection).
     config_path: Box<Path>,
+    /// Absolute, canonicalized watch root — used to relativize event paths
+    /// before glob matching (globset anchors relative patterns at path start).
+    watch_root: Box<Path>,
     /// Optional diff store for recording file change diffs.
     diff_store: Option<SharedDiffStore>,
     cancel: CancellationToken,
@@ -329,13 +341,15 @@ impl WorkerContext {
 
                     match result {
                         Ok(event) => {
-                            if !is_relevant_event(&event.kind) {
-                                continue;
-                            }
-
-                            for path in event.paths.iter() {
-                                let raw = path.to_string_lossy().to_string();
-                                self.debouncer.add_event(raw, event_time);
+                            // Only *relevant* events are queued, but we must
+                            // still fall through to drain_ready() below — a
+                            // steady stream of irrelevant events must not starve
+                            // already-pending changes (previously `continue`d).
+                            if is_relevant_event(&event.kind) {
+                                for path in event.paths.iter() {
+                                    let raw = path.to_string_lossy().to_string();
+                                    self.debouncer.add_event(raw, event_time);
+                                }
                             }
                         }
                         Err(e) => {
@@ -390,6 +404,10 @@ impl WorkerContext {
     fn handle_path(&mut self, path: &Path) {
         let raw = path.to_string_lossy().to_string();
         let normalized = normalize_path(&raw);
+        // notify delivers absolute paths; relativize to the watch root so that
+        // anchored include/exclude and config `watch:` globs match (see
+        // filter::relativize_to_root).
+        let rel = crate::filter::relativize_to_root(path, &self.watch_root);
 
         // Detect config file change → hot-reload.
         if path == self.config_path.as_ref() {
@@ -407,7 +425,7 @@ impl WorkerContext {
         }
 
         // Global include/exclude filter.
-        if !self.filter.is_allowed(&normalized) {
+        if !self.filter.is_allowed(&rel) {
             debug!(path = %normalized, "skipped by filter");
             return;
         }
@@ -420,7 +438,7 @@ impl WorkerContext {
         // Try each loaded config.
         let mut handled = false;
         for cfg in &self.configs {
-            if !cfg.matches(&normalized) {
+            if !cfg.matches(&rel) {
                 continue;
             }
             handled = true;
@@ -428,17 +446,16 @@ impl WorkerContext {
 
             set_status(&self.statuses, &cfg.name, "reloading");
 
-            // Run on_change / build command if configured.
+            // Run on_change / build command SYNCHRONOUSLY before notifying, so
+            // the browser reload reflects the finished build rather than stale
+            // output.  Serializing in the worker also prevents overlapping build
+            // processes racing on the same output files.
             if let Some(cmd) = cfg.command_for(&normalized) {
                 info!(config = %cfg.name, cmd = %cmd, "running command");
-                let timeout = self.cmd_timeout;
-                let cmd_clone = cmd.clone();
-                tokio::task::spawn_blocking(move || {
-                    run_command_blocking(&cmd_clone, timeout, None, None);
-                });
+                run_command_blocking(&cmd, self.cmd_timeout, self.max_memory_mb, self.max_cpu_seconds);
             }
 
-            // Notify browser clients.
+            // Notify browser clients (after the build completes).
             notify_clients(&self.btx, path, &normalized, &cfg.notify, &cfg.name);
 
             set_status(&self.statuses, &cfg.name, "up to date");
@@ -466,16 +483,14 @@ impl WorkerContext {
             return;
         }
 
-        // Generic fallback: run the configured command template and reload.
+        // Generic fallback: run the configured command template, THEN reload,
+        // so the browser sees the finished output.  Running synchronously in the
+        // worker also serializes builds (no overlapping processes on a burst).
         let cmd = self
             .cmd_template
             .replace("{path}", &shell_escape(&normalized));
         info!(cmd = %cmd, "running fallback command");
-        let timeout = self.cmd_timeout;
-        let cmd_clone = cmd.clone();
-        tokio::task::spawn_blocking(move || {
-            run_command_blocking(&cmd_clone, timeout, None, None);
-        });
+        run_command_blocking(&cmd, self.cmd_timeout, self.max_memory_mb, self.max_cpu_seconds);
         broadcast_reload(&self.btx, &normalized, "default");
     }
 }
@@ -512,6 +527,8 @@ pub fn start(
         statuses,
         cancel,
         cmd_timeout_ms,
+        max_memory_mb,
+        max_cpu_seconds,
         connection_count: _connection_count,
         diff_store,
     } = params;
@@ -544,7 +561,7 @@ pub fn start(
         let timeout = cmd_timeout;
         tokio::task::spawn_blocking(move || {
             info!(cmd = %cmd, "running startup command");
-            run_command_blocking(&cmd, timeout, None, None);
+            run_command_blocking(&cmd, timeout, max_memory_mb, max_cpu_seconds);
         });
     }
 
@@ -558,7 +575,10 @@ pub fn start(
         cmd_template,
         debouncer: Debouncer::new(Duration::from_millis(debounce_ms)),
         cmd_timeout,
+        max_memory_mb,
+        max_cpu_seconds,
         config_path,
+        watch_root,
         diff_store,
         cancel,
     };
@@ -1368,8 +1388,11 @@ mod tests {
             cmd_template: "echo {path}".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(200)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1407,8 +1430,11 @@ mod tests {
             cmd_template: "echo {path}".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(200)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1453,8 +1479,11 @@ mod tests {
             cmd_template: "echo {path}".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1508,8 +1537,11 @@ mod tests {
             cmd_template: "echo changed".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1577,8 +1609,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1631,8 +1666,11 @@ mod tests {
             cmd_template: "echo {path}".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1695,8 +1733,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1733,6 +1774,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn handle_path_matches_relative_config_glob_on_absolute_path() {
+        // Regression: notify delivers ABSOLUTE paths. A config `watch: "src/**/*.rs"`
+        // (relative, as the README teaches) must still match, and the default
+        // excludes must still fire on absolute paths under the watch root.
+        let (btx, mut brx) = broadcast::channel::<String>(16);
+        let statuses = crate::server::new_status_map(vec!["app".to_string()]);
+        let root = std::env::temp_dir().join("quay_test_relmatch");
+        let cfg_path = root.join("quay.yaml").into_boxed_path();
+
+        let mut configs =
+            crate::config::parse_configs("- name: app\n  watch: \"src/**/*.rs\"\n  notify: reload\n");
+        for c in &mut configs {
+            c.compile_watch_set();
+        }
+        assert_eq!(configs.len(), 1, "config should parse");
+
+        let mut ctx = WorkerContext {
+            rx: std_mpsc::channel().1,
+            btx,
+            filter: PathFilter::with_defaults(&[]),
+            configs,
+            statuses,
+            cmd_template: "echo {path}".to_string(),
+            debouncer: Debouncer::new(Duration::from_millis(10)),
+            cmd_timeout: None,
+            watch_root: root.clone().into_boxed_path(),
+            config_path: cfg_path,
+            diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
+            cancel: CancellationToken::new(),
+        };
+
+        // Absolute path under a relative config glob → matches → reload broadcast.
+        ctx.handle_path(&root.join("src").join("main.rs"));
+        let msg = brx
+            .try_recv()
+            .expect("relative config glob must match an absolute path");
+        assert!(msg.contains("reload"), "expected reload, got {msg}");
+
+        // Absolute path inside target/ → default excludes must skip it.
+        ctx.handle_path(&root.join("target").join("debug").join("x.o"));
+        assert!(
+            brx.try_recv().is_err(),
+            "target/ artifact must be filtered out (no broadcast)"
+        );
+    }
+
     // -- Config hot-reload detection ---------------------------------------
 
     #[test]
@@ -1765,8 +1855,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: canonical.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: canonical.clone(),
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1839,8 +1932,11 @@ mod tests {
             cmd_template: "echo multi".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1894,8 +1990,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -1951,8 +2050,11 @@ mod tests {
             cmd_template: "echo fallback {path}".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2009,8 +2111,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2067,8 +2172,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2127,8 +2235,11 @@ mod tests {
             cmd_template: "echo rapid".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(5)),
             cmd_timeout: Some(Duration::from_secs(2)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2183,8 +2294,11 @@ mod tests {
             cmd_template: "echo chaos".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(1)),
             cmd_timeout: Some(Duration::from_secs(1)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2452,8 +2566,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2527,8 +2644,11 @@ mod tests {
             cmd_template: "echo test".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(1)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2593,8 +2713,11 @@ mod tests {
             cmd_template: "echo debounce".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(100)), // Short debounce for test.
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2820,8 +2943,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(5)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2888,8 +3014,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -2968,8 +3097,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3041,8 +3173,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3095,8 +3230,11 @@ mod tests {
             cmd_template: "echo removed".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: Some(Duration::from_secs(2)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3154,8 +3292,11 @@ mod tests {
             cmd_template: "echo rename".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3213,8 +3354,11 @@ mod tests {
             cmd_template: "echo cycle".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(1)),
             cmd_timeout: Some(Duration::from_secs(1)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3304,8 +3448,11 @@ mod tests {
             cmd_template: "echo concurrent".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(1)),
             cmd_timeout: Some(Duration::from_secs(2)),
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: None,
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3437,8 +3584,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 
@@ -3504,8 +3654,11 @@ mod tests {
             cmd_template: "echo noop".to_string(),
             debouncer: Debouncer::new(Duration::from_millis(10)),
             cmd_timeout: None,
+            watch_root: cfg_path.parent().unwrap_or(std::path::Path::new(".")).into(),
             config_path: cfg_path,
             diff_store: Some(diff_store.clone()),
+            max_memory_mb: None,
+            max_cpu_seconds: None,
             cancel: CancellationToken::new(),
         };
 

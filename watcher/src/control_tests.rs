@@ -323,8 +323,6 @@
             diff_store,
             None,
             None,
-            None,
-            None,
         );
 
         // Give the server a moment to start accepting.
@@ -575,8 +573,6 @@
             statuses.clone(),
             cancel.clone(),
             counter.clone(),
-            None,
-            None,
             None,
             None,
             None,

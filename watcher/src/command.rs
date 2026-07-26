@@ -16,7 +16,7 @@
 //! on Unix, `cmd /C` on Windows) and optionally enforces a timeout so that
 //! stuck builds cannot block the worker thread indefinitely.
 
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
@@ -84,19 +84,10 @@ pub fn shell_escape(s: &str) -> String {
 pub fn run_command_blocking(
     cmd: &str,
     timeout: Option<Duration>,
-    _max_memory_mb: Option<u32>,
-    _max_cpu_seconds: Option<u32>,
+    max_memory_mb: Option<u32>,
+    max_cpu_seconds: Option<u32>,
 ) {
-    let result = {
-        #[cfg(target_os = "windows")]
-        {
-            Command::new("cmd").args(["/C", cmd]).spawn()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Command::new("sh").args(["-c", cmd]).spawn()
-        }
-    };
+    let result = spawn_command(cmd, max_memory_mb, max_cpu_seconds);
 
     match result {
         Ok(mut child) => {
@@ -122,8 +113,7 @@ pub fn run_command_blocking(
                                     timeout_ms = dur.as_millis() as u64,
                                     "command timed out; killing process"
                                 );
-                                let _ = child.kill();
-                                let _ = child.wait(); // reap
+                                kill_child_tree(&mut child);
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(50));
@@ -152,6 +142,75 @@ pub fn run_command_blocking(
         }
         Err(e) => error!(cmd, error = %e, "failed to spawn command"),
     }
+}
+
+/// Build and spawn the shell command.  On Unix the child is placed in its own
+/// process group (so a timeout can kill the whole descendant tree, not just the
+/// `sh` wrapper) and optional `setrlimit` memory/CPU limits are applied in the
+/// child before `exec`.  On Windows these limits are unsupported and ignored.
+fn spawn_command(
+    cmd: &str,
+    max_memory_mb: Option<u32>,
+    max_cpu_seconds: Option<u32>,
+) -> std::io::Result<Child> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (max_memory_mb, max_cpu_seconds); // unsupported on Windows
+        Command::new("cmd").args(["/C", cmd]).spawn()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Own process group so the whole tree can be signalled on timeout.
+            c.process_group(0);
+            if max_memory_mb.is_some() || max_cpu_seconds.is_some() {
+                let mem = max_memory_mb;
+                let cpu = max_cpu_seconds;
+                // SAFETY: only calls the async-signal-safe `setrlimit` between
+                // fork and exec; touches no allocator or shared state.
+                unsafe {
+                    c.pre_exec(move || {
+                        if let Some(mb) = mem {
+                            let bytes = (mb as libc::rlim_t).saturating_mul(1024 * 1024);
+                            let lim = libc::rlimit { rlim_cur: bytes, rlim_max: bytes };
+                            libc::setrlimit(libc::RLIMIT_AS, &lim);
+                        }
+                        if let Some(secs) = cpu {
+                            let lim = libc::rlimit {
+                                rlim_cur: secs as libc::rlim_t,
+                                rlim_max: secs as libc::rlim_t,
+                            };
+                            libc::setrlimit(libc::RLIMIT_CPU, &lim);
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+        c.spawn()
+    }
+}
+
+/// Kill the spawned command.  On Unix this signals the child's entire process
+/// group (created via `process_group(0)`) so orphaned grandchildren (e.g. the
+/// `node` a `npm run build` spawned) are killed too, then reaps the child.
+#[cfg(unix)]
+fn kill_child_tree(child: &mut Child) {
+    // A negative pid targets the process group with that id.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_child_tree(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------

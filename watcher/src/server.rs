@@ -16,7 +16,7 @@
 
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use prometheus::IntGauge;
+use crate::metrics;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -79,32 +79,67 @@ pub fn spawn_ws_server(
     btx: broadcast::Sender<String>,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
-    _tls_cert: Option<String>,
-    _tls_key: Option<String>,
-    _max_connections: Option<u32>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    max_connections: Option<u32>,
 ) {
-    let ws_gauge = IntGauge::new("quay_ws_connections", "WebSocket connections")
-        .expect("failed to create ws_connections gauge");
-    let _ = prometheus::default_registry().register(Box::new(ws_gauge.clone()));
+    // Build a TLS acceptor when both a cert and key are supplied.  A partial or
+    // broken TLS config is fatal for this server rather than silently serving
+    // plaintext under a `wss://` expectation.
+    let tls_acceptor = match (tls_cert.as_deref(), tls_key.as_deref()) {
+        (Some(cert), Some(key)) => match build_tls_acceptor(cert, key) {
+            Ok(acc) => {
+                info!("TLS enabled for the WebSocket server (wss://)");
+                Some(acc)
+            }
+            Err(e) => {
+                error!(error = %e, "failed to load TLS cert/key; WebSocket server not started");
+                return;
+            }
+        },
+        (None, None) => None,
+        _ => {
+            error!("both --tls-cert and --tls-key are required for TLS; starting without it");
+            None
+        }
+    };
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
                     info!("WebSocket accept loop shutting down");
-                    ws_gauge.set(0);
+                    metrics::ws_connections().set(0);
                     break;
                 }
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
+                            // Enforce the concurrent-connection cap (established clients).
+                            if let Some(max) = max_connections {
+                                if connection_count.load(std::sync::atomic::Ordering::Relaxed)
+                                    >= max as usize
+                                {
+                                    debug!(%addr, "WebSocket connection rejected: max-connections reached");
+                                    continue;
+                                }
+                            }
                             let peer_btx = btx.clone();
                             let peer_cancel = cancel.clone();
                             let peer_counter = connection_count.clone();
-                            let ws_gauge = ws_gauge.clone();
+                            let acceptor = tls_acceptor.clone();
                             tokio::spawn(async move {
-                                ws_gauge.inc();
-                                handle_ws_client(stream, addr, peer_btx, peer_cancel, peer_counter, None).await;
-                                ws_gauge.dec();
+                                match acceptor {
+                                    Some(acc) => match acc.accept(stream).await {
+                                        Ok(tls) => {
+                                            handle_ws_client(tls, addr, peer_btx, peer_cancel, peer_counter).await;
+                                        }
+                                        Err(e) => debug!(%addr, error = %e, "TLS handshake failed"),
+                                    },
+                                    None => {
+                                        handle_ws_client(stream, addr, peer_btx, peer_cancel, peer_counter).await;
+                                    }
+                                }
                             });
                         }
                         Err(e) => {
@@ -119,28 +154,59 @@ pub fn spawn_ws_server(
     });
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket client handling
-// ---------------------------------------------------------------------------
+/// Load a certificate chain + private key from PEM files and build a rustls
+/// [`tokio_rustls::TlsAcceptor`].  Accepts PKCS#8 or RSA private keys.
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> std::io::Result<tokio_rustls::TlsAcceptor> {
+    use std::io::{Error, ErrorKind};
+    use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 
-/// Handle a single WebSocket client connection.
+    let cert_pem = std::fs::read(cert_path)?;
+    let key_pem = std::fs::read(key_path)?;
+
+    let certs: Vec<Certificate> = rustls_pemfile::certs(&mut &cert_pem[..])?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    if certs.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "no certificates in cert file"));
+    }
+
+    let key = {
+        let mut pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &key_pem[..])?;
+        if let Some(k) = pkcs8.pop() {
+            PrivateKey(k)
+        } else {
+            let mut rsa = rustls_pemfile::rsa_private_keys(&mut &key_pem[..])?;
+            match rsa.pop() {
+                Some(k) => PrivateKey(k),
+                None => return Err(Error::new(ErrorKind::InvalidData, "no private key in key file")),
+            }
+        }
+    };
+
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Handle a single WebSocket client connection over any transport `S`
+/// (plain TCP or a TLS stream).
 ///
-/// The lifecycle is:
-/// 1. Complete the WebSocket handshake (with a 10 s timeout).
-/// 2. Increment the connection counter.
-/// 3. Forward broadcast messages to the client until disconnect or cancellation.
-/// 4. Decrement the connection counter on exit.
-async fn handle_ws_client(
-    stream: tokio::net::TcpStream,
+/// Lifecycle: handshake (10s timeout) → count up → forward broadcasts until
+/// disconnect/cancel → count down.  The `quay_ws_connections` gauge is kept in
+/// lock-step with the shared counter so `/metrics` agrees with `status`.
+async fn handle_ws_client<S>(
+    stream: S,
     addr: std::net::SocketAddr,
     btx: broadcast::Sender<String>,
     cancel: CancellationToken,
     connection_count: Arc<AtomicUsize>,
-    _max_connections: Option<u32>,
-) {
-    // Apply a timeout to the WebSocket handshake so that a client that opens a
-    // raw TCP connection but never sends the HTTP Upgrade request cannot hold
-    // resources indefinitely.
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let ws_stream = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio_tungstenite::accept_async(stream),
@@ -159,6 +225,7 @@ async fn handle_ws_client(
     };
 
     let count = watcher::track_connect(&connection_count);
+    metrics::ws_connections().set(count as i64);
     info!(%addr, connections = count, "WebSocket client connected");
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -189,16 +256,23 @@ async fn handle_ws_client(
     });
 
     // Drain incoming messages (we don't use them) to detect disconnects.
-    let mut message_count = 0;
+    // Rate-limit rather than lifetime-limit: >100 frames within any 10s window
+    // is abusive, but an occasional frame over a long-lived connection is fine.
+    let mut message_count = 0u32;
+    let mut window_start = std::time::Instant::now();
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
             frame = ws_rx.next() => {
                 match frame {
                     Some(Ok(_)) => {
+                        if window_start.elapsed() >= std::time::Duration::from_secs(10) {
+                            window_start = std::time::Instant::now();
+                            message_count = 0;
+                        }
                         message_count += 1;
                         if message_count > 100 {
-                            warn!(%addr, "WebSocket client sent too many messages, disconnecting");
+                            warn!(%addr, "WebSocket client exceeded 100 messages/10s, disconnecting");
                             break;
                         }
                     }
@@ -210,6 +284,7 @@ async fn handle_ws_client(
 
     send_task.abort();
     let count = watcher::track_disconnect(&connection_count);
+    metrics::ws_connections().set(count as i64);
     info!(%addr, connections = count, "WebSocket client disconnected");
 }
 
